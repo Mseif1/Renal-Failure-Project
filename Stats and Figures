@@ -11,16 +11,32 @@ invisible(lapply(required_pkgs, function(p) {
 
 setwd("~/Desktop/Projects/Renal Failure project")
 
-cat("=== PRF Statistical Summary & ML Dataset Export ===\n")
-cat("Timestamp:", format(Sys.time()), "\n\n")
+# Logging helper: write detailed logs to a timestamped file and keep console output minimal
+LOG_FILE <- sprintf("PRF_export_%s.log", format(Sys.time(), "%Y%m%d_%H%M%S"))
+
+log_write <- function(level, ...) {
+  msg <- paste(..., sep = " ")
+  line <- sprintf("[%s] %-5s %s", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), level, msg)
+  cat(line, "\n", file = LOG_FILE, append = TRUE)
+}
+log_info  <- function(..., console = FALSE) { log_write("INFO", ...); if (console) message(paste(...)) }
+log_warn  <- function(..., console = FALSE) { log_write("WARN", ...); if (console) message(paste(...)) }
+log_error <- function(..., console = FALSE) { log_write("ERROR", ...); if (console) message(paste(...)) }
+
+# Minimal console header
+message("=== PRF Statistical Summary & ML Dataset Export ===")
+message("Logging to:", LOG_FILE)
+log_info("=== PRF Statistical Summary & ML Dataset Export ===")
+log_info("Timestamp:", format(Sys.time()))
 
 
 
 # 1. VERIFY REQUIRED OBJECTS ARE IN ENVIRONMENT
 
-cat("--- Checking required objects ---\n")
+log_info("--- Checking required objects ---")
 
 if (!all(sapply(c("ALL_CASES", "ALL_TRAIN", "ALL_TEST"), exists))) {
+  log_error("Missing ALL_CASES / ALL_TRAIN / ALL_TEST. Run the current PRF_preprocessing_v3.R first, or load('prf_workspace.RData'). (This script was reworked to use the multi-case list structure -- it no longer looks for flat ds_preop/train_preop-style objects.)", console = TRUE)
   stop(paste(
     "Missing ALL_CASES / ALL_TRAIN / ALL_TEST.",
     "Run the current PRF_preprocessing_v3.R first, or load('prf_workspace.RData').",
@@ -73,21 +89,16 @@ cases_present <- intersect(names(CASE_INFO), names(ALL_CASES))
 cases_split   <- intersect(cases_present, intersect(names(ALL_TRAIN), names(ALL_TEST)))
 cases_skipped <- setdiff(cases_present, cases_split)
 
-cat(sprintf("Found %d of %d expected cases in ALL_CASES: %s\n",
-            length(cases_present), length(CASE_INFO), paste(cases_present, collapse = ", ")))
+log_info(sprintf("Found %d of %d expected cases in ALL_CASES: %s", length(cases_present), length(CASE_INFO), paste(cases_present, collapse = ", ")))
 
 for (cn in cases_present) {
   df <- ALL_CASES[[cn]]
-  cat(sprintf("  %-22s %5d rows x %3d cols | PRF=%.2f%%\n",
-              cn, nrow(df), ncol(df), 100 * mean(df$PRF)))
+  log_info(sprintf("  %-22s %5d rows x %3d cols | PRF=%.2f%%", cn, nrow(df), ncol(df), 100 * mean(df$PRF)))
 }
 
 if (length(cases_skipped) > 0) {
-  cat(sprintf(
-    "\nNOTE: %d case(s) have no train/test split (skipped upstream for insufficient data): %s\n",
-    length(cases_skipped), paste(cases_skipped, collapse = ", ")))
-  cat("      Table 1 statistics will still be produced for these (real-data only);\n")
-  cat("      ML train/test exports will be skipped for them.\n")
+  log_warn(sprintf("NOTE: %d case(s) have no train/test split (skipped upstream for insufficient data): %s", length(cases_skipped), paste(cases_skipped, collapse = ", ")))
+  log_info("Table 1 statistics will still be produced for these (real-data only); ML train/test exports will be skipped for them.")
 }
 
 # Cases with at least 1 row AND both PRF classes present. A case requiring
@@ -105,15 +116,11 @@ cases_empty <- cases_present[sapply(cases_present, function(cn) {
 cases_nonempty <- setdiff(cases_present, cases_empty)
 
 if (length(cases_empty) > 0) {
-  cat(sprintf(
-    "\nNOTE: %d case(s) are EMPTY or single-class and will be excluded from Table 1 / pre-split exports: %s\n",
-    length(cases_empty), paste(cases_empty, collapse = ", ")))
-  cat("      This should be rare with the current duration-based BP phase definition --\n")
-  cat("      if it occurs, check the BP phase distribution in the preprocessing log and\n")
-  cat("      confirm with the collaborator whether it reflects a real data gap.\n")
+  log_warn(sprintf("NOTE: %d case(s) are EMPTY or single-class and will be excluded from Table 1 / pre-split exports: %s", length(cases_empty), paste(cases_empty, collapse = ", ")))
+  log_info("This should be rare with the current duration-based BP phase definition -- if it occurs, check the BP phase distribution in the preprocessing log and confirm with the collaborator whether it reflects a real data gap.")
 }
 
-cat("\nAll required objects found.\n")
+log_info("All required objects found.")
 
 
 
@@ -122,7 +129,7 @@ cat("\nAll required objects found.\n")
 # Statistics are ALWAYS computed on the real (pre-oversampling) ALL_CASES
 # datasets. The oversampled ALL_TRAIN datasets contain synthetic SMOTE-NC
 # rows and must never be used for descriptive statistics or Table 1.
-cat("\n--- Preparing data for gtsummary ---\n")
+log_info("--- Preparing data for gtsummary ---")
 
 # Non-clinical columns to drop before summarising
 DROP_FOR_SUMMARY <- c("New_MRN", "Surgery_Date", "Surgery_Date_parsed",
@@ -143,7 +150,7 @@ prepare_for_summary <- function(df, label) {
       PRF = factor(PRF, levels = c(0, 1), labels = c("No PRF", "PRF")),
       across(where(is.character), as.factor)
     )
-  cat(sprintf("  %-22s %d rows, %d variables\n", label, nrow(df), ncol(df) - 1))
+  log_info(sprintf("  %-22s %d rows, %d variables", label, nrow(df), ncol(df) - 1))
   df
 }
 
@@ -230,10 +237,10 @@ for (cn in cases_nonempty) {
 
 # 3. BUILD GTSUMMARY TABLES
 
-cat("\n--- Building gtsummary tables ---\n")
+log_info("--- Building gtsummary tables ---")
 
 build_summary_table <- function(df, dataset_label, dataset_desc) {
-  cat(sprintf("  Building: %s\n", dataset_label))
+  log_info(sprintf("Building: %s", dataset_label))
 
   df  <- apply_labels(df)
   num_cols <- names(df)[sapply(df, is.numeric)   & names(df) != "PRF"]
@@ -248,7 +255,7 @@ build_summary_table <- function(df, dataset_label, dataset_desc) {
       type         = list(all_of(num_cols) ~ "continuous",
                           all_of(cat_cols) ~ "categorical"),
       statistic    = list(all_continuous()  ~ "{median} ({p25}, {p75})",
-                          all_categorical() ~ "{n} ({p}%)"),
+                          all_categorical() ~ "{n} ({p}%)}"),
       digits       = list(all_continuous()  ~ 2,
                           all_categorical() ~ c(0, 1))
     ) %>%
@@ -283,13 +290,13 @@ for (cn in cases_nonempty) {
   tbls[[cn]] <- build_summary_table(
     summary_dfs[[cn]], CASE_INFO[[cn]]$label, CASE_INFO[[cn]]$desc)
 }
-cat(sprintf("  All %d table(s) built.\n", length(tbls)))
+log_info(sprintf("All %d table(s) built.", length(tbls)))
 
 
 
 # 4. EXPORT STATISTICS TO EXCEL
 
-cat("\n--- Exporting statistics to Excel ---\n")
+log_info("--- Exporting statistics to Excel ---")
 
 tbl_to_df <- function(tbl) {
   as_tibble(tbl) %>%
@@ -380,8 +387,7 @@ for (cn in cases_nonempty) {
 }
 
 if (length(cases_empty) > 0) {
-  cat(sprintf("  Skipped Table 1 sheet(s) for empty case(s): %s\n",
-              paste(cases_empty, collapse = ", ")))
+  log_info(sprintf("Skipped Table 1 sheet(s) for empty case(s): %s", paste(cases_empty, collapse = ", ")))
 }
 
 # Dataset summary sheet -- one row per case, all 7 if present
@@ -437,14 +443,15 @@ if (length(zero_n_cases) > 0) {
 }
 
 saveWorkbook(stats_wb, "PRF_Statistics_Table1.xlsx", overwrite = TRUE)
-cat("  Saved: PRF_Statistics_Table1.xlsx\n")
+log_info("Saved: PRF_Statistics_Table1.xlsx")
+message("Saved PRF_Statistics_Table1.xlsx")
 
 
 
 # 5. EXPORT ML-READY DATASETS TO EXCEL
 #    One train + one test file per case that has a usable split.
 #    PRF column stored as character ("No_PRF" / "PRF") not integer (0/1).
-cat("\n--- Exporting ML-ready datasets ---\n")
+log_info("--- Exporting ML-ready datasets ---")
 
 # Convert PRF integer column to descriptive character labels
 label_prf <- function(df) {
@@ -469,9 +476,7 @@ write_ml_excel <- function(df, filename) {
     path = filename
   )
 
-  cat(sprintf("  Saved: %-45s  %d rows x %d cols  PRF=%.2f%%\n",
-              filename, nrow(df), ncol(df),
-              100 * mean(df$PRF == "PRF")))
+  log_info(sprintf("Saved: %-45s  %d rows x %d cols  PRF=%.2f%%", filename, nrow(df), ncol(df), 100 * mean(df$PRF == "PRF")))
 }
 
 ml_train_files <- character(0)
@@ -488,8 +493,7 @@ for (cn in cases_split) {
 }
 
 if (length(cases_skipped) > 0) {
-  cat(sprintf("  Skipped ML export for: %s (no train/test split available)\n",
-              paste(cases_skipped, collapse = ", ")))
+  log_info(sprintf("Skipped ML export for: %s (no train/test split available)", paste(cases_skipped, collapse = ", ")))
 }
 
 
@@ -508,7 +512,7 @@ if (length(cases_skipped) > 0) {
 #    Operational date/time columns removed.
 #    Built for all cases in ALL_CASES (this doesn't depend on the
 #    train/test split, so it's unaffected by any skipped case).
-cat("\n--- Exporting pre-split datasets ---\n")
+log_info("--- Exporting pre-split datasets ---")
 
 # Columns that are operational only and not needed in the analysis files
 DROP_OPERATIONAL <- c("Surgery_Date", "Surgery_Date_parsed",
@@ -557,8 +561,7 @@ for (cn in cases_nonempty) {
 }
 
 if (length(cases_empty) > 0) {
-  cat(sprintf("  Skipped pre-split export for empty case(s): %s\n",
-              paste(cases_empty, collapse = ", ")))
+  log_info(sprintf("Skipped pre-split export for empty case(s): %s", paste(cases_empty, collapse = ", ")))
 }
 
 # Sheet names must be <=31 chars and unique -- CASE_INFO labels all qualify
@@ -566,21 +569,19 @@ raw_sheets <- setNames(presplit_raw, sapply(cases_nonempty, function(cn) CASE_IN
 enc_sheets <- setNames(presplit_enc, sapply(cases_nonempty, function(cn) CASE_INFO[[cn]]$label))
 
 write_xlsx(raw_sheets, path = "PRF_PreSplit_Raw.xlsx")
-cat(sprintf("  Saved: PRF_PreSplit_Raw.xlsx       (%d KB)  — categorical columns as text\n",
-            round(file.size("PRF_PreSplit_Raw.xlsx") / 1024)))
+log_info(sprintf("Saved: PRF_PreSplit_Raw.xlsx       (%d KB)  — categorical columns as text", round(file.size("PRF_PreSplit_Raw.xlsx") / 1024)))
+message("Saved PRF_PreSplit_Raw.xlsx")
 for (cn in cases_nonempty) {
   df <- presplit_raw[[cn]]
-  cat(sprintf("    %-22s %5d rows x %3d cols | PRF: %d events (%.2f%%)\n",
-              CASE_INFO[[cn]]$label, nrow(df), ncol(df),
-              sum(df$PRF == "PRF"), 100 * mean(df$PRF == "PRF")))
+  log_info(sprintf("    %-22s %5d rows x %3d cols | PRF: %d events (%.2f%%)", CASE_INFO[[cn]]$label, nrow(df), ncol(df), sum(df$PRF == "PRF"), 100 * mean(df$PRF == "PRF")))
 }
 
 write_xlsx(enc_sheets, path = "PRF_PreSplit_Encoded.xlsx")
-cat(sprintf("  Saved: PRF_PreSplit_Encoded.xlsx   (%d KB)  — k-1 dummy encoded\n",
-            round(file.size("PRF_PreSplit_Encoded.xlsx") / 1024)))
+log_info(sprintf("Saved: PRF_PreSplit_Encoded.xlsx   (%d KB)  — k-1 dummy encoded", round(file.size("PRF_PreSplit_Encoded.xlsx") / 1024)))
+message("Saved PRF_PreSplit_Encoded.xlsx")
 for (cn in cases_nonempty) {
   df <- presplit_enc[[cn]]
-  cat(sprintf("    %-22s %5d rows x %3d cols\n", CASE_INFO[[cn]]$label, nrow(df), ncol(df)))
+  log_info(sprintf("    %-22s %5d rows x %3d cols", CASE_INFO[[cn]]$label, nrow(df), ncol(df)))
 }
 
 # Also write each case as its own standalone flat CSV -- same content as the
@@ -591,63 +592,53 @@ for (cn in cases_nonempty) {
 # statistical-analysis scripts, which expect one dataset file per case
 # rather than a sheet reference inside a workbook.
 dir.create("case_datasets", showWarnings = FALSE)
-cat("\n  Flat per-case CSVs (case_datasets/):\n")
+log_info("Flat per-case CSVs (case_datasets/):")
 for (cn in cases_nonempty) {
   df <- presplit_raw[[cn]]
   out_path <- file.path("case_datasets", sprintf("%s.csv", cn))
   write.csv(df, out_path, row.names = FALSE)
-  cat(sprintf("    %-22s -> %-45s %5d rows x %3d cols | PRF: %d events (%.2f%%)\n",
-              cn, out_path, nrow(df), ncol(df),
-              sum(df$PRF == "PRF"), 100 * mean(df$PRF == "PRF")))
+  log_info(sprintf("    %-22s -> %-45s %5d rows x %3d cols | PRF: %d events (%.2f%%)", cn, out_path, nrow(df), ncol(df), sum(df$PRF == "PRF"), 100 * mean(df$PRF == "PRF")))
 }
 if (length(cases_empty) > 0) {
-  cat(sprintf("    (skipped empty case(s): %s)\n", paste(cases_empty, collapse = ", ")))
+  log_info(sprintf("    (skipped empty case(s): %s)", paste(cases_empty, collapse = ", ")))
 }
 
 
 
 # 7. FINAL SUMMARY
 
-cat("\n=============================================\n")
-cat("  EXPORT COMPLETE\n")
-cat("=============================================\n")
+log_info("=============================================")
+log_info("EXPORT COMPLETE")
+log_info("=============================================")
 
-cat(sprintf("\n  PRF_Statistics_Table1.xlsx  %d KB  (%d case sheet(s) + Dataset Summary)\n",
-            round(file.size("PRF_Statistics_Table1.xlsx") / 1024), length(cases_nonempty)))
+log_info(sprintf("PRF_Statistics_Table1.xlsx  %d KB  (%d case sheet(s) + Dataset Summary)", round(file.size("PRF_Statistics_Table1.xlsx") / 1024), length(cases_nonempty)))
 
 if (length(ml_train_files) > 0) {
-  cat(sprintf("\n  ML train/test exports (%d of %d cases had a usable split):\n",
-              length(cases_split), length(cases_present)))
+  log_info(sprintf("ML train/test exports (%d of %d cases had a usable split):", length(cases_split), length(cases_present)))
   for (i in seq_along(ml_train_files)) {
-    cat(sprintf("    %-30s %5d KB\n", ml_train_files[i], round(file.size(ml_train_files[i]) / 1024)))
-    cat(sprintf("    %-30s %5d KB\n", ml_test_files[i],  round(file.size(ml_test_files[i])  / 1024)))
+    log_info(sprintf("    %-30s %5d KB", ml_train_files[i], round(file.size(ml_train_files[i]) / 1024)))
+    log_info(sprintf("    %-30s %5d KB", ml_test_files[i],  round(file.size(ml_test_files[i])  / 1024)))
   }
 } else {
-  cat("\n  No cases had a usable train/test split -- no ML train/test files exported.\n")
+  log_info("No cases had a usable train/test split -- no ML train/test files exported.")
 }
 
-cat(sprintf("\n  PRF_PreSplit_Raw.xlsx       %d KB  (%d sheets)\n",
-            round(file.size("PRF_PreSplit_Raw.xlsx") / 1024), length(cases_nonempty)))
-cat(sprintf("  PRF_PreSplit_Encoded.xlsx   %d KB  (%d sheets)\n",
-            round(file.size("PRF_PreSplit_Encoded.xlsx") / 1024), length(cases_nonempty)))
-cat(sprintf("  case_datasets/*.csv         %d flat per-case CSVs (whole dataset, pre-split, no oversampling)\n",
-            length(cases_nonempty)))
+log_info(sprintf("PRF_PreSplit_Raw.xlsx       %d KB  (%d sheets)", round(file.size("PRF_PreSplit_Raw.xlsx") / 1024), length(cases_nonempty)))
+log_info(sprintf("PRF_PreSplit_Encoded.xlsx   %d KB  (%d sheets)", round(file.size("PRF_PreSplit_Encoded.xlsx") / 1024), length(cases_nonempty)))
+log_info(sprintf("case_datasets/*.csv         %d flat per-case CSVs (whole dataset, pre-split, no oversampling)", length(cases_nonempty)))
 
-cat("\nKey reminders:\n")
-cat("  1. Table 1 uses REAL patient data only — never oversampled.\n")
-cat("  2. Training sets contain SMOTE-NC synthetic rows — ML use only.\n")
-cat("  3. Test sets contain REAL patients at natural PRF prevalence.\n")
-cat("  4. PRF is always the last column in every ML dataset sheet.\n")
-cat("  5. Row 1 of each ML sheet is a metadata note, not a patient record.\n")
+log_info("Key reminders:")
+log_info("  1. Table 1 uses REAL patient data only — never oversampled.")
+log_info("  2. Training sets contain SMOTE-NC synthetic rows — ML use only.")
+log_info("  3. Test sets contain REAL patients at natural PRF prevalence.")
+log_info("  4. PRF is always the last column in every ML dataset sheet.")
+log_info("  5. Row 1 of each ML sheet is a metadata note, not a patient record.")
 if (length(cases_skipped) > 0) {
-  cat(sprintf("  6. %d case(s) had no train/test split due to insufficient data: %s.\n",
-              length(cases_skipped), paste(cases_skipped, collapse = ", ")))
-  cat("     Table 1 for these cases still reflects real (if small) patient counts.\n")
+  log_info(sprintf("  6. %d case(s) had no train/test split due to insufficient data: %s.", length(cases_skipped), paste(cases_skipped, collapse = ", ")))
+  log_info("     Table 1 for these cases still reflects real (if small) patient counts.")
 }
 if (length(cases_empty) > 0) {
-  cat(sprintf("  7. %d case(s) are completely EMPTY (0 patients): %s.\n",
-              length(cases_empty), paste(cases_empty, collapse = ", ")))
-  cat("     No Table 1, no pre-split export, no ML export for these -- likely because\n")
-  cat("     no patient has BP recorded in all of the required phases simultaneously.\n")
+  log_info(sprintf("  7. %d case(s) are completely EMPTY (0 patients): %s.", length(cases_empty), paste(cases_empty, collapse = ", ")))
+  log_info("     No Table 1, no pre-split export, no ML export for these -- likely because no patient has BP recorded in all of the required phases simultaneously.")
 }
-cat(sprintf("\nCompleted: %s\n", format(Sys.time())))
+log_info(sprintf("Completed: %s", format(Sys.time())), console = TRUE)
