@@ -1,0 +1,1466 @@
+
+# PRF PREPROCESSING PIPELINE
+# University of Louisville  |  Renal Failure Project 2026
+# PRF definition
+
+# Approved preprocessing steps (Steps 1–17, plus new steps noted above):
+#   1.  Exclude patients on preoperative dialysis
+#   2.  Exclude patients with baseline creatinine >= 4 mg/dL
+#   3.  Drop columns with > 50% missing data
+#   4.  Delete rows missing low-missingness variables (numeric ≤1%, categorical ≤2%)
+#   5.  Deduplicate: keep most recent surgery per patient
+#   6.  Drop near-zero-variance categorical columns (< 1% positive cases)
+#   7.  Combine chronic lung disease severity + type into one variable
+#   8.  Remove hematocrit, height, weight (collinear with Hgb and BMI)
+#   9.  Drop Last A1C Level (~9% missing; correlated with diabetes and age)
+#   9b. Drop MELD Score (derived score; per collaborator instruction) [NEW]
+#   10. Log-transform Platelet Count (highly right-skewed)
+#   CABG/VALVE. Include iff CAB (planned/unplanned) OR Valve == "Yes" [NEW]
+#   11. [BP] Align BP readings to most recent surgery per patient
+#   12. [BP] Remove postoperative rows with missing SBP
+#   13. Stratified 70/30 train-test split (createDataPartition) — run per case
+#   14. [Train only] Random Under-Sampling (RUS) — 10:1 neg:pos ratio
+#   15. [Train only] Z-score normalisation (fit on train, applied to test)
+#   16. [Train only] SMOTE-NC (k=5) — double the minority class
+#   17. k-1 dummy encoding of all categorical variables
+
+# 0. SETUP 
+required_pkgs <- c("readxl", "dplyr", "lubridate", "stringr",
+                   "caret", "themis", "fastDummies")
+
+invisible(lapply(required_pkgs, function(p) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+  library(p, character.only = TRUE)
+}))
+
+set.seed(2026)
+options(dplyr.summarise.inform = FALSE)
+
+# Set working directory to project folder — all outputs saved here
+setwd("~/Desktop/Projects/Renal Failure project")
+
+# File paths
+STS_PATH <- "sts21_25_deid_V2.xlsx"
+BP_PATH  <- "MEAN_BP_first48h_deid_729.csv"
+
+# Log helpers
+LOG <- character()
+log_msg <- function(...) {
+  msg <- paste0(...)
+  cat(msg, "\n")
+  LOG <<- c(LOG, msg)
+}
+log_step <- function(step, desc, n_before = NULL, n_after = NULL) {
+  if (!is.null(n_before) && !is.null(n_after))
+    log_msg(sprintf("[Step %s] %s  |  rows: %d -> %d (removed %d)",
+                    step, desc, n_before, n_after, n_before - n_after))
+  else
+    log_msg(sprintf("[Step %s] %s", step, desc))
+}
+
+log_msg("=== PRF Preprocessing Pipeline — Steps 1-17 ===")
+log_msg(paste("Timestamp:", format(Sys.time())))
+
+
+
+# 1. LOAD DATA
+
+log_msg("\n--- Loading data ---")
+sts_raw <- read_excel(STS_PATH, sheet = "Main Data", col_types = "text")
+
+NUMERIC_COLS <- c(
+  "Patient Age", "Height (cm)", "Weight (kg)", "Calculated BMI",
+  "Last Creatinine Level",
+  "Peak Postoperative Creatinine Level within 48 hours of OR Exit",
+  "Peak Postoperative Creatinine Level prior to discharge",
+  "Total Albumin", "Total Bilirubin", "WBC Count", "Hemoglobin",
+  "Hematocrit", "Platelet Count", "Sodium", "INR", "MELD Score",
+  "Last A1C Level", "Hemo Data-EF", "Cardiopulmonary Bypass Time",
+  "Lowest Intra-op Hemoglobin", "Highest Intra-op Glucose",
+  "New_MRN"
+)
+NUMERIC_COLS <- NUMERIC_COLS[NUMERIC_COLS %in% names(sts_raw)]
+
+sts_raw <- sts_raw %>%
+  mutate(across(all_of(NUMERIC_COLS), ~suppressWarnings(as.numeric(.))))
+
+log_msg(sprintf("STS loaded: %d rows, %d columns (%d cast to numeric)",
+                nrow(sts_raw), ncol(sts_raw), length(NUMERIC_COLS)))
+
+bp_raw <- read.csv(BP_PATH, stringsAsFactors = FALSE)
+BP_NUMERIC_COLS <- c("New_MRN", "mean_bp", "SBP", "DBP", "hours_from_start")
+bp_raw <- bp_raw %>%
+  mutate(across(all_of(BP_NUMERIC_COLS[BP_NUMERIC_COLS %in% names(bp_raw)]),
+                ~suppressWarnings(as.numeric(.))))
+
+log_msg(sprintf("BP loaded:  %d rows, %d columns", nrow(bp_raw), ncol(bp_raw)))
+
+
+
+# 2. BMI IMPUTATION (must run on sts_raw before column selection)
+log_msg("\n--- BMI imputation ---")
+
+n_bmi_missing <- sum(is.na(sts_raw$`Calculated BMI`))
+sts_raw <- sts_raw %>%
+  mutate(
+    BMI = case_when(
+      !is.na(`Calculated BMI`)                        ~ `Calculated BMI`,
+      !is.na(`Weight (kg)`) & !is.na(`Height (cm)`)
+        & `Height (cm)` > 0                           ~ `Weight (kg)` /
+                                                          (`Height (cm)` / 100)^2,
+      TRUE                                             ~ NA_real_
+    )
+  )
+
+log_msg(sprintf("BMI: %d missing -> imputed %d from height/weight -> %d still missing",
+                n_bmi_missing,
+                n_bmi_missing - sum(is.na(sts_raw$BMI)),
+                sum(is.na(sts_raw$BMI))))
+
+
+
+# 3. COLUMN SELECTION
+
+# README colour coding:
+#   Yellow  = preoperative risk variables         -> include
+#   Pink    = preoperative medications            -> include
+#   Blue    = procedure information               -> include
+#   Green   = postoperative outcome fields        -> keep creatinine peaks and
+#             dialysis column for PRF construction only, then drop
+#   Magenta = exclusion variables                 -> use then drop
+#   Gray    = "can be ignored" per README
+#             EXCEPTION: key lab values and race multi-select columns are
+#             retained despite being gray as they are clinically essential.
+#   Height (cm), Weight (kg), Calculated BMI are NOT kept — BMI (imputed)
+#   replaces all three.
+log_msg("\n--- Column selection ---")
+
+COLS_TO_KEEP <- c(
+  # Identifiers (used for joining/deduplication; not model features)
+  "New_MRN",
+  "Surgery_Date",
+  "OR Entry Date And Time",   # used to compute surgery duration for BP split
+  "OR Exit Date And Time",    # used to compute surgery duration for BP split
+
+  # Magenta — exclusion variables (used then dropped)
+  "VAD-Patient Admitted With VAD",
+  "Ventricular Assist Device Implanted During This Hospitalization",
+
+  # Green — outcome construction only (dropped after PRF is created)
+  "Peak Postoperative Creatinine Level within 48 hours of OR Exit",
+  "Peak Postoperative Creatinine Level prior to discharge",
+  "Post-Op-Renal-Dialysis Req",
+
+  # Yellow — preoperative risk variables
+  "Patient Age",
+  "Sex",
+  "BMI",                                    # imputed above from height/weight
+  "RF-Diabetes",
+  "RF-Renal Fail-Dialysis",                 # Step 1 exclusion variable
+  "RF-Hypertension",
+  "RF- Endocarditis",
+  "RF-Tobacco Use",
+  "RF-Chronic Lung Disease",                # Step 7: combined with type
+  "RF-Chronic Lung Disease - Type",         # Step 7: merged then dropped
+  "Immunocompromised Present",
+  "Mediastinal Radiation",                  # Step 6 NZV check
+  "Cancer Within 5 Years",
+  "Peripheral Artery Disease",
+  "Cerebrovascular Disease",
+  "Total Albumin",
+  "Last Creatinine Level",                  # baseline creatinine for PRF
+  "Total Bilirubin",
+  "Prev Cardiac Interventions",
+  "Prior MI",
+  "Heart Failure",
+  "Classification-NYHA",
+  "Cardiogenic Shock",
+  "Resuscitation",
+  "Cardiac Arrhythmia",
+  "Hemo Data-EF",
+  "Status",
+  "Incidence",
+
+  # Gray — retained for clinical relevance despite README "can be ignored"
+  "Race - Multi-Select-1",                  # individual binary race cols are 95% NA;
+  "Race - Multi-Select-2",                  # multi-select used instead
+  "Race - Multi-Select-3",
+  "Race - Multi-Select-4",
+  "Race - Multi-Select-5",
+  "Race - Multi-Select-6",
+  "Hispanic or Latino or Spanish Ethnicity",
+  "WBC Count",
+  "Hemoglobin",
+  "Hematocrit",                             # Step 8: removed (collinear with Hgb)
+  "Platelet Count",                         # Step 10: log-transformed
+  "Sodium",
+  "INR",
+  "MELD Score",
+  "Last A1C Level",                         # Step 9: removed (~9% missing)
+  "RF-Home Oxygen",
+  "RF-Inhaled Medication or Oral Bronchodilator Therapy",
+  "RF-Sleep Apnea",
+  "RF-Pneumonia",
+  "RF-Alcohol Use",                         # 56% missing -> dropped by Step 3
+  "RF-Liver Disease",
+  "RF-Liver Cirrhosis",
+  "Unresponsive State",                     # Step 6 NZV check
+  "Syncope",
+
+  # Pink — preoperative medications
+  "Meds-ACE Inhibitors or ARB Within 48 Hours",
+  "Meds-Beta Blockers Within 24 Hours",
+  "Meds-ADP Inhibitors Within Five Days",
+  "Meds-Aspirin Within Five Days",
+  "Meds-Anticoagulants Within 48 Hours",
+  "Meds-Inotropes Within 48 Hours",
+  "Meds-Steroids Within 24 Hours",
+
+  # Blue — procedure variables
+  "CAB",
+  "Valve",
+  "Cardiopulmonary Bypass Time",
+
+  # Blue — NEW INTRAOP FEATURES per README (previously never wired in)
+  "Lowest Intra-op Hemoglobin",
+  "Highest Intra-op Glucose"
+)
+
+# Silently drop any listed column absent from this extract
+COLS_TO_KEEP <- COLS_TO_KEEP[COLS_TO_KEEP %in% names(sts_raw)]
+sts <- select(sts_raw, all_of(COLS_TO_KEEP))
+log_msg(sprintf("Retained %d columns from %d total", ncol(sts), ncol(sts_raw)))
+
+
+
+# 4. OPERATIONAL PREREQUISITES
+#    (date parsing, race construction, flags)
+#    These are data-preparation necessities, not preprocessing tracker steps.
+
+log_msg("\n--- Operational prerequisites ---")
+
+# Parse surgery date
+sts <- sts %>%
+  mutate(Surgery_Date_parsed = mdy(Surgery_Date))
+
+# Restrict to Saif's exact study window (2021-01-01 to 2024-12-31), if enabled,
+# for a direct comparison against his results -- see RESTRICT_TO_2021_2024
+# near the top of this script.
+if (RESTRICT_TO_2021_2024) {
+  n_before <- nrow(sts)
+  sts <- filter(sts, Surgery_Date_parsed >= COHORT_DATE_MIN,
+               Surgery_Date_parsed <= COHORT_DATE_MAX)
+  log_step("2021-2024-RESTRICTION",
+           sprintf("Restrict to Saif's study window (%s to %s)",
+                   COHORT_DATE_MIN, COHORT_DATE_MAX),
+           n_before, nrow(sts))
+} else {
+  log_msg("RESTRICT_TO_2021_2024 is FALSE -- using the full 2021-2025 cohort.")
+}
+
+# Race: binary race columns are 95% NA; construct from Multi-Select columns
+sts <- sts %>%
+  mutate(
+    Race = coalesce(
+      `Race - Multi-Select-1`, `Race - Multi-Select-2`,
+      `Race - Multi-Select-3`, `Race - Multi-Select-4`,
+      `Race - Multi-Select-5`, `Race - Multi-Select-6`
+    ),
+    Race = case_when(
+      Race == "White"                     ~ "White",
+      Race == "Black/African American"    ~ "Black/African American",
+      Race == "Asian"                     ~ "Asian",
+      Race == "Am Indian/Alaskan"         ~ "American Indian/Alaskan Native",
+      Race == "Hawaiian/Pacific Islander" ~ "Native Hawaiian/Pacific Islander",
+      Race == "Other"                     ~ "Other",
+      TRUE                                ~ "Unknown/Not Documented"
+    )
+  ) %>%
+  select(-starts_with("Race - Multi-Select-"))
+log_msg("Race variable constructed from Multi-Select columns")
+cat(capture.output(print(table(sts$Race, useNA = "always"))), sep = "\n")
+
+n_before <- nrow(sts)
+sts <- filter(sts,
+              is.na(`Hispanic or Latino or Spanish Ethnicity`) |
+                `Hispanic or Latino or Spanish Ethnicity` != "Not Documented")
+log_step("EXCL-ETHNICITY", "Exclude Not Documented ethnicity", n_before, nrow(sts))
+
+n_before <- nrow(sts)
+sts <- filter(sts, is.na(Race) | Race != "Unknown/Not Documented")
+log_step("EXCL-RACE", "Exclude Unknown/Not Documented race", n_before, nrow(sts))
+
+
+# flag_missing_bp: per collaborator, patients with surgery before 2021-07-01
+# had no digitally-captured ANES/OR-monitor BP device readings (bp_id =
+# "ANES_BP"), because that specific capture device/system wasn't in place
+# yet. NOTE: this does NOT mean pre-2021-07-01 patients lack intraoperative
+# BP entirely -- under the current duration-based phase definition (phase is
+# decided by hours_from_start vs. actual surgery duration, regardless of
+# bp_id/device), most of these patients still have SOME BP row -- from a
+# cuff (MAP_BMDI) or arterial line (SBP&DBP_Art) -- falling inside their
+# surgical window, so they aren't automatically excluded from intraop-
+# requiring cases.
+#
+# Left as FALSE/inert below because has_intraop_bp/has_postop_bp already
+# filter on ACTUAL data presence per patient (built from the real BP file
+# rows, using the duration-based phase, not device/anchor type), which
+# handles device availability correctly without needing a separate
+# hardcoded date rule. Kept as a named flag in case a future extract needs
+# an explicit date-based override.
+sts <- sts %>%
+  mutate(
+    flag_missing_bp = FALSE,
+    # Emergent Salvage: very high mortality; flagged for analyst review
+    flag_emergent_salvage = (!is.na(Status) & Status == "Emergent Salvage")
+  )
+
+log_msg(sprintf("flag_missing_bp (pre-2021-07-01): %d patients",
+                sum(sts$flag_missing_bp)))
+log_msg(sprintf("flag_emergent_salvage: %d patients (not excluded; analyst decision)",
+                sum(sts$flag_emergent_salvage)))
+
+
+
+# 5. PRF OUTCOME CONSTRUCTION
+
+# Postoperative creatinine = maximum of two peak values:
+#   (a) within 48h of OR exit
+#   (b) prior to discharge
+# Patients where both are NA and no dialysis recorded -> indeterminate -> excluded.
+# Post-Op-Renal-Dialysis Req: blank in STS = not required (treated as No).
+log_msg("\n--- PRF outcome construction ---")
+
+sts <- sts %>%
+  mutate(
+    creatinine_baseline   = `Last Creatinine Level`,
+    creatinine_postop     = pmax(
+      `Peak Postoperative Creatinine Level within 48 hours of OR Exit`,
+      `Peak Postoperative Creatinine Level prior to discharge`,
+      na.rm = TRUE
+    ),
+    dialysis_postop = (!is.na(`Post-Op-Renal-Dialysis Req`) &
+                         `Post-Op-Renal-Dialysis Req` == "Yes"),
+    PRF = case_when(
+      dialysis_postop                                              ~ 1L,
+      !is.na(creatinine_postop) & !is.na(creatinine_baseline) &
+        creatinine_postop >= 2.0 * creatinine_baseline            ~ 1L,
+      is.na(creatinine_postop) & !dialysis_postop                 ~ NA_integer_,
+      TRUE                                                         ~ 0L
+    )
+  ) %>%
+  select(
+    -`Peak Postoperative Creatinine Level within 48 hours of OR Exit`,
+    -`Peak Postoperative Creatinine Level prior to discharge`,
+    -`Post-Op-Renal-Dialysis Req`,
+    -creatinine_postop,
+    -dialysis_postop
+  )
+
+log_msg(sprintf("PRF=1: %d  |  PRF=0: %d  |  Indeterminate: %d",
+                sum(sts$PRF == 1, na.rm = TRUE),
+                sum(sts$PRF == 0, na.rm = TRUE),
+                sum(is.na(sts$PRF))))
+
+n_before <- nrow(sts)
+sts <- filter(sts, !is.na(PRF))
+log_msg(sprintf("Removed %d indeterminate PRF patients", n_before - nrow(sts)))
+
+
+
+# STEP 1 — Exclude patients on preoperative dialysis
+
+n_before <- nrow(sts)
+sts <- filter(sts, is.na(`RF-Renal Fail-Dialysis`) |
+                !(`RF-Renal Fail-Dialysis` %in% c("Yes", "Unknown")))
+log_step(1, "Exclude preop dialysis patients", n_before, nrow(sts))
+sts <- select(sts, -`RF-Renal Fail-Dialysis`)
+
+# VAD exclusions (hard exclusions per collaborator)
+n_before <- nrow(sts)
+sts <- filter(sts, is.na(`VAD-Patient Admitted With VAD`) |
+                `VAD-Patient Admitted With VAD` != "Yes")
+log_step("VAD-A", "Exclude VAD-admitted patients", n_before, nrow(sts))
+
+n_before <- nrow(sts)
+sts <- filter(sts,
+              is.na(`Ventricular Assist Device Implanted During This Hospitalization`) |
+                `Ventricular Assist Device Implanted During This Hospitalization` != "Yes")
+log_step("VAD-I", "Exclude VAD implanted during hospitalisation", n_before, nrow(sts))
+
+sts <- select(sts,
+              -`VAD-Patient Admitted With VAD`,
+              -`Ventricular Assist Device Implanted During This Hospitalization`)
+
+# Convert "Unknown" to NA for all binary Yes/No comorbidity columns
+sts <- sts %>%
+  mutate(across(
+    where(~is.character(.) && all(na.omit(.) %in% c("Yes", "No", "Unknown"))),
+    ~na_if(., "Unknown")
+  ))
+log_msg(sprintf("Converted 'Unknown' to NA across all binary Yes/No columns"))
+# Convert NYHA "Not Documented" to NA
+# BUGFIX: the real data contains the value "Not documented" (lowercase "d"),
+# but this used to compare against "Not Documented" (capital "D") via na_if(),
+# which is case-sensitive -- so the conversion was silently matching 0 rows.
+# 2,615 of 3,692 rows (70.8%) were retaining "Not documented" as a live
+# category instead of being treated as missing. Fixed to match case-
+# insensitively so it catches this value regardless of capitalization.
+if ("Classification-NYHA" %in% names(sts)) {
+  n_not_doc <- sum(str_to_lower(sts$`Classification-NYHA`) == "not documented", na.rm = TRUE)
+  sts <- sts %>%
+    mutate(`Classification-NYHA` = if_else(
+      str_to_lower(`Classification-NYHA`) == "not documented",
+      NA_character_,
+      `Classification-NYHA`
+    ))
+  log_msg(sprintf("Converted %d NYHA 'Not documented'/'Not Documented' values to NA", n_not_doc))
+}
+n_before <- nrow(sts)
+sts <- filter(sts, !flag_emergent_salvage)
+log_step("EMERGENT", "Exclude Emergent Salvage patients", n_before, nrow(sts))
+
+# CABG/VALVE INCLUSION FILTER  [NEW — previously missing]
+#
+# README (Magenta exclusion notes) / email item #4:
+#   "For all analyses, only CABG and Valve cases should be used in the
+#    analysis. Include iff (column 'CAB' (planned and unplanned)) OR
+#    (column 'Valve' is Yes)."
+#
+# CAB is documented as having planned/unplanned/no-type values rather than a
+# strict Yes/No; the filter below treats anything that isn't an explicit "No"
+# (case-insensitive) as an included CAB case. The unique-value log lines let
+# an analyst confirm the actual coding in this extract before trusting the
+# filter — please check this log output against the real data on first run.
+log_msg("\n--- CABG/Valve surgery type inclusion filter ---")
+log_msg(sprintf("  CAB unique values:   %s",
+                paste(unique(sts$CAB), collapse = " | ")))
+log_msg(sprintf("  Valve unique values: %s",
+                paste(unique(sts$Valve), collapse = " | ")))
+
+n_before <- nrow(sts)
+sts <- filter(sts,
+              (!is.na(CAB)   & !(str_to_lower(CAB) %in% c("no"))) |
+              (!is.na(Valve) & str_to_lower(Valve) == "yes"))
+log_step("CABG-VALVE", "Include only CABG (planned/unplanned) or Valve = Yes cases",
+         n_before, nrow(sts))
+
+# STEP 2 — Exclude patients with baseline creatinine >= 4 mg/dL
+
+n_before <- nrow(sts)
+sts <- filter(sts, is.na(creatinine_baseline) | creatinine_baseline < 4.0)
+log_step(2, "Exclude baseline creatinine >= 4 mg/dL", n_before, nrow(sts))
+
+# STEP 3 Drop columns with > 50% missing data
+
+log_msg("\n--- Step 3: Drop columns > 50% missing ---")
+
+miss_rate <- sapply(sts, function(x) mean(is.na(x)))
+cols_drop  <- names(miss_rate[miss_rate > 0.50])
+
+for (col in cols_drop)
+  log_msg(sprintf("  Dropping: %-55s  (%.1f%% missing)", col, 100 * miss_rate[col]))
+
+sts <- select(sts, -all_of(cols_drop))
+log_step(3, sprintf("Dropped %d columns with >50%% missing", length(cols_drop)))
+
+
+
+# STEP 4 — Row deletion for low-missingness variables
+#           Numeric: <= 1% missing  |  Categorical: <= 2% missing
+
+log_msg("\n--- Step 4: Row deletion for low-missingness variables ---")
+
+EXCLUDE_FROM_MISS_CHECK <- c(
+  "New_MRN", "Surgery_Date", "Surgery_Date_parsed",
+  "OR Entry Date And Time", "OR Exit Date And Time",
+  "PRF", "Race", "BMI", "creatinine_baseline",
+  "flag_missing_bp", "flag_emergent_salvage"
+)
+
+study_cols     <- setdiff(names(sts), EXCLUDE_FROM_MISS_CHECK)
+miss_study     <- sapply(sts[study_cols], function(x) mean(is.na(x)))
+is_numeric_col <- sapply(sts[study_cols], is.numeric)
+
+num_row_delete <- names(miss_study[ is_numeric_col & miss_study > 0 & miss_study <= 0.01])
+cat_row_delete <- names(miss_study[!is_numeric_col & miss_study > 0 & miss_study <= 0.02])
+
+log_msg(sprintf("  Numeric row-delete   (n=%d): %s",
+                length(num_row_delete), paste(num_row_delete, collapse = ", ")))
+log_msg(sprintf("  Categorical row-delete (n=%d): %s",
+                length(cat_row_delete), paste(cat_row_delete, collapse = ", ")))
+
+n_before <- nrow(sts)
+if (length(num_row_delete) > 0)
+  sts <- filter(sts, if_all(all_of(num_row_delete), ~!is.na(.)))
+if (length(cat_row_delete) > 0)
+  sts <- filter(sts, if_all(all_of(cat_row_delete), ~!is.na(.)))
+log_step(4, "Row deletion for low-missingness variables", n_before, nrow(sts))
+
+# Report intermediate missingness (>1% numeric, >2% categorical) for analyst review
+mid_miss <- miss_study[
+  (is_numeric_col  & miss_study > 0.01 & miss_study <= 0.50) |
+  (!is_numeric_col & miss_study > 0.02 & miss_study <= 0.50)
+]
+if (length(mid_miss) > 0) {
+  log_msg("  NOTE — intermediate missingness (no approved handling yet):")
+  for (col in names(mid_miss))
+    log_msg(sprintf("    %-45s  %.2f%%", col, 100 * mid_miss[col]))
+}
+
+
+
+# STEP 5 — Deduplicate: keep most recent surgery per patient
+
+n_before <- nrow(sts)
+sts <- sts %>%
+  arrange(New_MRN, desc(Surgery_Date_parsed)) %>%
+  distinct(New_MRN, .keep_all = TRUE)
+log_step(5, "Deduplicate: kept most recent surgery per New_MRN", n_before, nrow(sts))
+
+
+
+# STEP 6 — Drop near-zero-variance categorical columns (< 1% positive cases)
+
+log_msg("\n--- Step 6: Near-zero-variance categorical columns ---")
+
+nzv_check_cols <- names(sts)[sapply(sts, function(x) {
+  is.character(x) && all(na.omit(x) %in% c("Yes", "No", "Unknown"))
+})]
+
+nzv_drop <- character()
+for (col in nzv_check_cols) {
+  pct_yes <- mean(sts[[col]] == "Yes", na.rm = TRUE)
+  log_msg(sprintf("  %-45s  %.2f%% Yes", col, 100 * pct_yes))
+  if (pct_yes < 0.01) nzv_drop <- c(nzv_drop, col)
+}
+
+if (length(nzv_drop) > 0) {
+  sts <- select(sts, -all_of(nzv_drop))
+  log_step(6, sprintf("Dropped %d NZV columns: %s",
+                      length(nzv_drop), paste(nzv_drop, collapse = ", ")))
+} else {
+  log_step(6, "No columns below 1% positive threshold")
+}
+
+
+
+# STEP 7 — Combine chronic lung disease severity + type into one variable
+
+log_msg("\n--- Step 7: Combine CLD severity + type ---")
+
+sts <- sts %>%
+  mutate(
+    CLD_Severity = case_when(
+      `RF-Chronic Lung Disease` == "No"                                  ~ "No",
+      `RF-Chronic Lung Disease` == "Mild"                                ~ "Mild",
+      `RF-Chronic Lung Disease` == "Moderate"                            ~ "Moderate",
+      `RF-Chronic Lung Disease` == "Severe"                              ~ "Severe",
+      str_detect(str_to_lower(`RF-Chronic Lung Disease`), "documented")  ~ "Documented_UnknownSeverity",
+      `RF-Chronic Lung Disease` == "Unknown"                             ~ "Unknown",
+      TRUE                                                                ~ NA_character_
+    ),
+    # Guard: Type column may have been dropped by Step 3 (>50% missing)
+    CLD_Type = if ("RF-Chronic Lung Disease - Type" %in% names(.)) {
+      case_when(
+        is.na(`RF-Chronic Lung Disease - Type`) |
+          `RF-Chronic Lung Disease - Type` == "Not Documented" ~ "Unknown",
+        TRUE ~ `RF-Chronic Lung Disease - Type`
+      )
+    } else {
+      "Unknown"
+    },
+    CLD_Combined = case_when(
+      CLD_Severity == "No"  ~ "No",
+      is.na(CLD_Severity)   ~ NA_character_,
+      TRUE                  ~ paste0(CLD_Severity, "_", CLD_Type)
+    )
+  ) %>%
+  select(-`RF-Chronic Lung Disease`,
+         -any_of("RF-Chronic Lung Disease - Type"),
+         -CLD_Severity, -CLD_Type)
+
+log_step(7, "CLD_Combined created from severity + type; source columns removed")
+cat(capture.output(sort(table(sts$CLD_Combined, useNA = "always"),
+                        decreasing = TRUE)), sep = "\n")
+
+n_cld_unk <- sum(sts$CLD_Combined %in%
+                   c("Unknown_Unknown", "Documented_UnknownSeverity_Unknown"),
+                 na.rm = TRUE)
+# Exclude patients with undocumentable CLD status
+# Unknown_Unknown = both severity and type unknown — not a valid clinical category
+# Documented_UnknownSeverity_Unknown = disease documented but neither severity
+#   nor type recorded — insufficient information for clinical use
+n_before <- nrow(sts)
+sts <- sts %>%
+  filter(!CLD_Combined %in% c("Unknown_Unknown",
+                              "Documented_UnknownSeverity_Unknown") |
+           is.na(CLD_Combined))
+log_step("EXCL-CLD", "Exclude Unknown/Unknown CLD_Combined patients",
+         n_before, nrow(sts))
+
+# STEP 8 — Remove hematocrit, height, weight
+
+# Hematocrit is highly collinear with Hemoglobin.
+# Height and Weight are not in sts (only BMI was kept from sts_raw),
+# but included in drop list with guard for safety.
+drop_step8 <- c("Hematocrit", "Height (cm)", "Weight (kg)")
+drop_step8 <- drop_step8[drop_step8 %in% names(sts)]
+if (length(drop_step8) > 0) {
+  sts <- select(sts, -all_of(drop_step8))
+  log_step(8, sprintf("Removed: %s", paste(drop_step8, collapse = ", ")))
+} else {
+  log_step(8, "Hematocrit/Height/Weight already absent from dataset")
+}
+
+
+
+# STEP 9 — Drop Last A1C Level
+
+# ~9% missing; correlated with diabetes (p=0.004) and age (p=0.007).
+# Imputation not appropriate given correlation structure.
+if ("Last A1C Level" %in% names(sts)) {
+  pct_a1c <- 100 * mean(is.na(sts$`Last A1C Level`))
+  sts <- select(sts, -`Last A1C Level`)
+  log_step(9, sprintf("Dropped Last A1C Level (%.1f%% missing)", pct_a1c))
+}
+
+
+
+# STEP 9b — Drop MELD Score  [NEW]
+#
+# README: "MELD score -> DROP". Email item #6: MELD is a score derived from
+# other values already in the dataset (creatinine, bilirubin, INR), so it is
+# dropped to avoid redundancy/leakage from its component labs.
+if ("MELD Score" %in% names(sts)) {
+  sts <- select(sts, -`MELD Score`)
+  log_step("9b", "Dropped MELD Score (derived score; redundant with component labs)")
+} else {
+  log_step("9b", "MELD Score already absent (likely dropped by Step 3 missingness rule)")
+}
+
+
+
+# STEP 10 — Log-transform Platelet Count
+
+# Range 15,500–761,000 cells/uL — highly right-skewed.
+# Natural log applied to reduce skew and improve ML model behaviour.
+# CHANGED: both the raw column and the log-transformed column are now kept
+# flowing through (previously the raw column was dropped here). Raw platelet
+# count is more clinically interpretable for descriptive statistics and
+# correlation analysis on the un-split dataset; the log-transformed version
+# remains appropriate for ML model training. The ML-specific pipeline
+# (Steps 14-17, see apply_pipeline_steps_14_to_17) drops the raw column
+# before scaling/SMOTE so model training behavior is unchanged from before.
+if ("Platelet Count" %in% names(sts)) {
+  sts <- sts %>%
+    mutate(Platelet_Count_log = log(`Platelet Count`))
+  log_step(10, "Platelet Count -> added log(Platelet Count); raw column kept")
+}
+
+log_msg("\n=== Preoperative dataset finalised ===")
+log_msg(sprintf("  Rows: %d  |  Cols: %d  |  PRF=%.2f%%",
+                nrow(sts), ncol(sts), 100 * mean(sts$PRF)))
+
+
+
+# BLOOD PRESSURE PREPROCESSING (Steps 11–12)
+
+log_msg("\n--- Blood pressure preprocessing ---")
+
+# README: exclude BP rows with missing New_MRN
+n_before_bp <- nrow(bp_raw)
+bp <- filter(bp_raw, !is.na(New_MRN))
+log_step("BP-MRN", "Removed BP rows with missing New_MRN", n_before_bp, nrow(bp))
+
+# Keep only BP rows for patients in the STS cohort
+n_before_bp <- nrow(bp)
+bp <- filter(bp, New_MRN %in% sts$New_MRN)
+log_step("BP-COHORT", "Kept BP rows for STS cohort only", n_before_bp, nrow(bp))
+log_msg(sprintf("  Unique patients in BP data: %d", n_distinct(bp$New_MRN)))
+
+# Parse measurement timestamp and surgery date in BP file
+bp <- bp %>%
+  mutate(
+    meas_dt             = mdy_hms(meas_dt,     quiet = TRUE),
+    Surgery_Date_parsed = mdy(Surgery_Date)
+  )
+
+# BP PHASE LABELING  [CORRECTED — bp_id is authoritative]
+#
+# CONFIRMED by collaborator: bp_id has 3 levels, and the mapping to phase is
+# definitive, not inferred:
+#   ANES_BP      -> Intraoperative (OR)
+#   SBP&DBP_Art  -> Postoperative (arterial line)
+#   MAP_BMDI     -> Postoperative (cuff)
+#
+# This supersedes two earlier (wrong) attempts at phase labeling:
+#   1. anchor_src string matching -- anchor_src turned out to just be the
+#      timestamp REFERENCE POINT used to compute hours_from_start, not the
+#      clinical phase, and produced ZERO patient overlap between intraop and
+#      postop (158 postop patients total), which was never plausible.
+#   2. hours_from_start vs. surgery-duration heuristic -- a reasonable proxy
+#      (gave ~2,642 postop / ~2,637 overlap) but still an approximation.
+#
+# bp_id gives a direct, authoritative phase label with no timestamp math
+# needed. Sanity check: median hours_from_start is ~3h for ANES_BP (fits
+# intraop), ~18.5h for SBP&DBP_Art, and ~31h for MAP_BMDI (both fit postop).
+# Under this definition: 2,488 patients have intraop BP, 2,642 have postop
+# BP, and 2,484 have BOTH -- so intraop_postop / preop_intraop_postop are
+# now well-populated cases rather than empty ones.
+
+log_msg("Deriving BP phase directly from bp_id (confirmed authoritative by collaborator)")
+if ("bp_id" %in% names(bp)) {
+  log_msg(sprintf("  bp_id unique values: %s", paste(unique(bp$bp_id), collapse = " | ")))
+
+  bp <- bp %>%
+    mutate(
+      bp_phase = case_when(
+        bp_id == "ANES_BP"                    ~ "Intraoperative",
+        bp_id %in% c("SBP&DBP_Art", "MAP_BMDI") ~ "Postoperative",
+        TRUE                                   ~ "Unknown"
+      )
+    )
+
+  n_unmapped <- sum(bp$bp_phase == "Unknown")
+  if (n_unmapped > 0)
+    log_msg(sprintf(
+      "  WARNING: %d BP rows have a bp_id value not in {ANES_BP, SBP&DBP_Art, MAP_BMDI} -> labeled 'Unknown' and excluded from both phases.",
+      n_unmapped))
+
+} else {
+  # Fallback only if bp_id is absent from a future extract.
+  log_msg("  WARNING: 'bp_id' column not found in this BP file -- falling back to")
+  log_msg("  hours_from_start vs. surgery-duration heuristic. Confirm with collaborator.")
+
+  or_times <- sts %>%
+    select(New_MRN, Surgery_Date_parsed,
+           OR_entry_str = `OR Entry Date And Time`,
+           OR_exit_str  = `OR Exit Date And Time`) %>%
+    mutate(
+      OR_entry = coalesce(
+        suppressWarnings(mdy_hms(OR_entry_str, quiet = TRUE)),
+        suppressWarnings(mdy_hm(OR_entry_str,  quiet = TRUE))
+      ),
+      OR_exit = coalesce(
+        suppressWarnings(mdy_hms(OR_exit_str, quiet = TRUE)),
+        suppressWarnings(mdy_hm(OR_exit_str,  quiet = TRUE))
+      ),
+      surgery_duration_hrs = as.numeric(difftime(OR_exit, OR_entry, units = "hours"))
+    ) %>%
+    select(New_MRN, Surgery_Date_parsed, surgery_duration_hrs)
+
+  bp <- left_join(bp, or_times, by = c("New_MRN", "Surgery_Date_parsed")) %>%
+    mutate(
+      bp_phase = case_when(
+        !is.na(surgery_duration_hrs) &
+          hours_from_start <= surgery_duration_hrs  ~ "Intraoperative",
+        !is.na(surgery_duration_hrs) &
+          hours_from_start >  surgery_duration_hrs  ~ "Postoperative",
+        is.na(surgery_duration_hrs) &
+          hours_from_start <= 6                     ~ "Intraoperative",
+        is.na(surgery_duration_hrs) &
+          hours_from_start >  6                     ~ "Postoperative",
+        TRUE                                        ~ "Unknown"
+      )
+    )
+}
+
+log_msg("BP phase distribution:")
+cat(capture.output(print(table(bp$bp_phase, useNA = "always"))), sep = "\n")
+
+
+
+# STEP 11 — Align BP to most recent surgery per patient
+log_msg("\n--- Step 11: BP alignment to most recent surgery ---")
+
+sts_date_lookup <- select(sts, New_MRN, Surgery_Date_parsed)
+n_before_bp <- nrow(bp)
+bp <- inner_join(bp, sts_date_lookup, by = c("New_MRN", "Surgery_Date_parsed"))
+log_step(11, "BP aligned to most-recent surgery per patient", n_before_bp, nrow(bp))
+
+
+
+# STEP 12 — Remove postoperative rows with missing SBP
+
+n_before_bp <- nrow(bp)
+bp <- filter(bp, !(bp_phase == "Postoperative" & is.na(SBP)))
+log_step(12, "Removed postop BP rows with missing SBP", n_before_bp, nrow(bp))
+
+
+
+# BP FEATURE ENGINEERING
+# 52 features per phase: 26 MAP + 26 SBP
+#   Summary stats    : mean, median, SD, min, max, range, Q1, Q3, IQR, ARV (10)
+#   Rates of change  : max rate, min rate, median rate, SD of rates (4)
+#   Threshold %      : 3 hypotensive + 3 hypertensive cutoffs (6)
+#   Spike/drop %     : drops of 20/40/60 mmHg + spikes of 20/40/60 mmHg (6)
+# Thresholds differ between intraoperative and postoperative phases.
+# No time-weighting (Step 19 not approved); no winsorisation (Step 18 not approved).
+
+log_msg("\n--- BP feature engineering ---")
+
+INTRA_MAP_LOW  <- c(55, 65, 75);  INTRA_MAP_HIGH <- c(95, 105, 115)
+INTRA_SBP_LOW  <- c(70, 80, 90);  INTRA_SBP_HIGH <- c(130, 140, 150)
+POST_MAP_LOW   <- c(50, 60, 70);  POST_MAP_HIGH  <- c(95, 105, 115)
+POST_SBP_LOW   <- c(80, 90, 100); POST_SBP_HIGH  <- c(170, 180, 190)
+
+compute_bp_features <- function(df_ph, map_low, map_high, sbp_low, sbp_high, prefix) {
+  df_ph %>%
+    arrange(New_MRN, meas_dt) %>%
+    group_by(New_MRN) %>%
+    summarise(
+      # MAP summary statistics
+      MAP_Mean        = mean(mean_bp,   na.rm = TRUE),
+      MAP_Median      = median(mean_bp, na.rm = TRUE),
+      MAP_SD          = sd(mean_bp,     na.rm = TRUE),
+      MAP_Min         = min(mean_bp,    na.rm = TRUE),
+      MAP_Max         = max(mean_bp,    na.rm = TRUE),
+      MAP_Range       = max(mean_bp,    na.rm = TRUE) - min(mean_bp, na.rm = TRUE),
+      MAP_Q1          = quantile(mean_bp, 0.25, na.rm = TRUE),
+      MAP_Q3          = quantile(mean_bp, 0.75, na.rm = TRUE),
+      MAP_IQR         = quantile(mean_bp, 0.75, na.rm = TRUE) -
+                        quantile(mean_bp, 0.25, na.rm = TRUE),
+      MAP_ARV         = mean(abs(diff(mean_bp[!is.na(mean_bp)])), na.rm = TRUE),
+      # MAP rates of change
+      MAP_Rate_Max    = {d <- diff(mean_bp[!is.na(mean_bp)]); if(length(d)) max(d)    else NA_real_},
+      MAP_Rate_Min    = {d <- diff(mean_bp[!is.na(mean_bp)]); if(length(d)) min(d)    else NA_real_},
+      MAP_Rate_Median = {d <- diff(mean_bp[!is.na(mean_bp)]); if(length(d)) median(d) else NA_real_},
+      MAP_Rate_SD     = {d <- diff(mean_bp[!is.na(mean_bp)]); if(length(d)) sd(d)     else NA_real_},
+      # MAP threshold features
+      MAP_Pct_Below_1 = mean(mean_bp < map_low[1],  na.rm = TRUE),
+      MAP_Pct_Below_2 = mean(mean_bp < map_low[2],  na.rm = TRUE),
+      MAP_Pct_Below_3 = mean(mean_bp < map_low[3],  na.rm = TRUE),
+      MAP_Pct_Above_1 = mean(mean_bp > map_high[1], na.rm = TRUE),
+      MAP_Pct_Above_2 = mean(mean_bp > map_high[2], na.rm = TRUE),
+      MAP_Pct_Above_3 = mean(mean_bp > map_high[3], na.rm = TRUE),
+      # MAP spike/drop features
+      MAP_Pct_Drop_20  = {d <- diff(mean_bp[!is.na(mean_bp)]); if(length(d)) mean(d < -20) else NA_real_},
+      MAP_Pct_Drop_40  = {d <- diff(mean_bp[!is.na(mean_bp)]); if(length(d)) mean(d < -40) else NA_real_},
+      MAP_Pct_Drop_60  = {d <- diff(mean_bp[!is.na(mean_bp)]); if(length(d)) mean(d < -60) else NA_real_},
+      MAP_Pct_Spike_20 = {d <- diff(mean_bp[!is.na(mean_bp)]); if(length(d)) mean(d >  20) else NA_real_},
+      MAP_Pct_Spike_40 = {d <- diff(mean_bp[!is.na(mean_bp)]); if(length(d)) mean(d >  40) else NA_real_},
+      MAP_Pct_Spike_60 = {d <- diff(mean_bp[!is.na(mean_bp)]); if(length(d)) mean(d >  60) else NA_real_},
+      # SBP summary statistics
+      SBP_Mean        = mean(SBP,   na.rm = TRUE),
+      SBP_Median      = median(SBP, na.rm = TRUE),
+      SBP_SD          = sd(SBP,     na.rm = TRUE),
+      SBP_Min         = min(SBP,    na.rm = TRUE),
+      SBP_Max         = max(SBP,    na.rm = TRUE),
+      SBP_Range       = max(SBP, na.rm = TRUE) - min(SBP, na.rm = TRUE),
+      SBP_Q1          = quantile(SBP, 0.25, na.rm = TRUE),
+      SBP_Q3          = quantile(SBP, 0.75, na.rm = TRUE),
+      SBP_IQR         = quantile(SBP, 0.75, na.rm = TRUE) -
+                        quantile(SBP, 0.25, na.rm = TRUE),
+      SBP_ARV         = mean(abs(diff(SBP[!is.na(SBP)])), na.rm = TRUE),
+      # SBP rates of change
+      SBP_Rate_Max    = {d <- diff(SBP[!is.na(SBP)]); if(length(d)) max(d)    else NA_real_},
+      SBP_Rate_Min    = {d <- diff(SBP[!is.na(SBP)]); if(length(d)) min(d)    else NA_real_},
+      SBP_Rate_Median = {d <- diff(SBP[!is.na(SBP)]); if(length(d)) median(d) else NA_real_},
+      SBP_Rate_SD     = {d <- diff(SBP[!is.na(SBP)]); if(length(d)) sd(d)     else NA_real_},
+      # SBP threshold features
+      SBP_Pct_Below_1 = mean(SBP < sbp_low[1],  na.rm = TRUE),
+      SBP_Pct_Below_2 = mean(SBP < sbp_low[2],  na.rm = TRUE),
+      SBP_Pct_Below_3 = mean(SBP < sbp_low[3],  na.rm = TRUE),
+      SBP_Pct_Above_1 = mean(SBP > sbp_high[1], na.rm = TRUE),
+      SBP_Pct_Above_2 = mean(SBP > sbp_high[2], na.rm = TRUE),
+      SBP_Pct_Above_3 = mean(SBP > sbp_high[3], na.rm = TRUE),
+      # SBP spike/drop features
+      SBP_Pct_Drop_20  = {d <- diff(SBP[!is.na(SBP)]); if(length(d)) mean(d < -20) else NA_real_},
+      SBP_Pct_Drop_40  = {d <- diff(SBP[!is.na(SBP)]); if(length(d)) mean(d < -40) else NA_real_},
+      SBP_Pct_Drop_60  = {d <- diff(SBP[!is.na(SBP)]); if(length(d)) mean(d < -60) else NA_real_},
+      SBP_Pct_Spike_20 = {d <- diff(SBP[!is.na(SBP)]); if(length(d)) mean(d >  20) else NA_real_},
+      SBP_Pct_Spike_40 = {d <- diff(SBP[!is.na(SBP)]); if(length(d)) mean(d >  40) else NA_real_},
+      SBP_Pct_Spike_60 = {d <- diff(SBP[!is.na(SBP)]); if(length(d)) mean(d >  60) else NA_real_},
+      .groups = "drop"
+    ) %>%
+    # Rename threshold columns with actual mmHg cutoff values
+    rename_with(.fn = function(nm) {
+      nm <- str_replace(nm, "MAP_Pct_Below_1", paste0("MAP_Pct_Below_", map_low[1]))
+      nm <- str_replace(nm, "MAP_Pct_Below_2", paste0("MAP_Pct_Below_", map_low[2]))
+      nm <- str_replace(nm, "MAP_Pct_Below_3", paste0("MAP_Pct_Below_", map_low[3]))
+      nm <- str_replace(nm, "MAP_Pct_Above_1", paste0("MAP_Pct_Above_", map_high[1]))
+      nm <- str_replace(nm, "MAP_Pct_Above_2", paste0("MAP_Pct_Above_", map_high[2]))
+      nm <- str_replace(nm, "MAP_Pct_Above_3", paste0("MAP_Pct_Above_", map_high[3]))
+      nm <- str_replace(nm, "SBP_Pct_Below_1", paste0("SBP_Pct_Below_", sbp_low[1]))
+      nm <- str_replace(nm, "SBP_Pct_Below_2", paste0("SBP_Pct_Below_", sbp_low[2]))
+      nm <- str_replace(nm, "SBP_Pct_Below_3", paste0("SBP_Pct_Below_", sbp_low[3]))
+      nm <- str_replace(nm, "SBP_Pct_Above_1", paste0("SBP_Pct_Above_", sbp_high[1]))
+      nm <- str_replace(nm, "SBP_Pct_Above_2", paste0("SBP_Pct_Above_", sbp_high[2]))
+      nm <- str_replace(nm, "SBP_Pct_Above_3", paste0("SBP_Pct_Above_", sbp_high[3]))
+      nm
+    }) %>%
+    rename_with(.fn = ~paste0(prefix, "_", .), .cols = -New_MRN)
+}
+
+bp_intra <- filter(bp, bp_phase == "Intraoperative")
+bp_post  <- filter(bp, bp_phase == "Postoperative")
+
+log_msg(sprintf("Intraop BP (before excluding first 3 readings/patient): %d readings | %d patients",
+                nrow(bp_intra), n_distinct(bp_intra$New_MRN)))
+log_msg(sprintf("Postop  BP (before excluding first 3 readings/patient): %d readings | %d patients",
+                nrow(bp_post), n_distinct(bp_post$New_MRN)))
+
+# Per Dr. Trivedi: exclude each patient's first 3 BP readings, per phase.
+# The device needs some time to initialize/stabilize, so the earliest
+# readings are somewhat artificial rather than reflecting the patient's
+# true BP. Applied per patient, per phase (intraop and postop handled
+# separately, matching how features are computed for each), ordered by
+# actual measurement time.
+EXCLUDE_FIRST_N_READINGS <- 3
+
+drop_first_n <- function(df, n) {
+  df %>%
+    arrange(New_MRN, meas_dt) %>%
+    group_by(New_MRN) %>%
+    filter(row_number() > n) %>%
+    ungroup()
+}
+
+bp_intra <- drop_first_n(bp_intra, EXCLUDE_FIRST_N_READINGS)
+bp_post  <- drop_first_n(bp_post,  EXCLUDE_FIRST_N_READINGS)
+
+log_msg(sprintf("Intraop BP (after excluding first %d readings/patient): %d readings | %d patients",
+                EXCLUDE_FIRST_N_READINGS, nrow(bp_intra), n_distinct(bp_intra$New_MRN)))
+log_msg(sprintf("Postop  BP (after excluding first %d readings/patient): %d readings | %d patients",
+                EXCLUDE_FIRST_N_READINGS, nrow(bp_post), n_distinct(bp_post$New_MRN)))
+log_msg("NOTE: a patient with <=3 readings in a phase now has 0 readings for that phase")
+log_msg("      (has_intraop_bp/has_postop_bp will correctly become FALSE for them).")
+
+feats_intra <- suppressWarnings(compute_bp_features(
+  bp_intra, INTRA_MAP_LOW, INTRA_MAP_HIGH, INTRA_SBP_LOW, INTRA_SBP_HIGH, "Intraop"))
+
+feats_post  <- suppressWarnings(compute_bp_features(
+  bp_post,  POST_MAP_LOW,  POST_MAP_HIGH,  POST_SBP_LOW,  POST_SBP_HIGH,  "Postop"))
+
+# Replace Inf/-Inf produced by min/max on single-reading patients with NA
+feats_intra <- mutate(feats_intra, across(where(is.numeric), ~ifelse(is.infinite(.), NA_real_, .)))
+feats_post  <- mutate(feats_post,  across(where(is.numeric), ~ifelse(is.infinite(.), NA_real_, .)))
+
+log_msg(sprintf("BP features computed: %d intraop | %d postop",
+                ncol(feats_intra) - 1, ncol(feats_post) - 1))
+
+
+
+# MERGE STS + BP FEATURES
+
+log_msg("\n--- Merging STS + BP features ---")
+
+sts_full <- sts %>%
+  left_join(feats_intra, by = "New_MRN") %>%
+  left_join(feats_post,  by = "New_MRN") %>%
+  mutate(
+    has_intraop_bp = !is.na(Intraop_MAP_Mean),
+    has_postop_bp  = !is.na(Postop_MAP_Mean)
+  )
+
+log_msg(sprintf("Patients with intraop BP: %d / %d",
+                sum(sts_full$has_intraop_bp), nrow(sts_full)))
+log_msg(sprintf("Patients with postop  BP: %d / %d",
+                sum(sts_full$has_postop_bp),  nrow(sts_full)))
+
+# FEATURE CATEGORIZATION  [FIXED — was the source of the leakage flagged in
+# the meeting]
+#
+# Previously PREOP_FEATS was defined as "everything that is not a BP column",
+# which silently pulled the Blue procedure variables (CAB, Valve,
+# Cardiopulmonary Bypass Time) into the preoperative-only feature set. Those
+# are intraoperative/procedure information (README Blue category) and must
+# only appear in intraoperative or later cases.
+#
+# Categories now used:
+#   BLUE_PROCEDURE_FEATS  - intraoperative procedure info (Blue)
+#   INTRAOP_BP_FEATS       - intraoperative BP features (computed above)
+#   POSTOP_BP_FEATS        - postoperative BP features (computed above)
+#   PREOP_FEATS            - everything else that is a genuine
+#                            preoperative (Yellow) / medication (Pink) feature
+#   ID_OUTCOME_COLS        - identifiers + outcome, carried into every case
+
+BLUE_PROCEDURE_FEATS <- intersect(
+  c("CAB", "Valve", "Cardiopulmonary Bypass Time",
+    "Lowest Intra-op Hemoglobin", "Highest Intra-op Glucose"),
+  names(sts_full)
+)
+
+INTRAOP_BP_FEATS <- names(sts_full)[str_starts(names(sts_full), "Intraop_")]
+POSTOP_BP_FEATS  <- names(sts_full)[str_starts(names(sts_full), "Postop_")]
+
+ID_OUTCOME_COLS <- intersect(
+  c("New_MRN", "Surgery_Date", "Surgery_Date_parsed",
+    "OR Entry Date And Time", "OR Exit Date And Time", "PRF"),
+  names(sts_full)
+)
+
+NON_FEATURE_COLS <- c(ID_OUTCOME_COLS, "flag_missing_bp", "flag_emergent_salvage",
+                      "has_intraop_bp", "has_postop_bp",
+                      # BUGFIX (per Dr. Trivedi): creatinine_baseline is a literal copy of
+                      # `Last Creatinine Level` created earlier purely to build the PRF
+                      # outcome and apply the baseline-creatinine>=4 exclusion (see lines
+                      # ~354-365, ~469). It was never excluded from the feature set
+                      # afterward, so it and `Last Creatinine Level` ended up as two
+                      # separate, perfectly duplicated columns in every case that includes
+                      # preop features -- most visible in Pre+Intra+Post since that case has
+                      # the most columns. `Last Creatinine Level` remains as the feature;
+                      # creatinine_baseline is now excluded here.
+                      "creatinine_baseline")
+
+PREOP_FEATS <- setdiff(
+  names(sts_full),
+  c(INTRAOP_BP_FEATS, POSTOP_BP_FEATS, BLUE_PROCEDURE_FEATS, NON_FEATURE_COLS)
+)
+
+log_msg(sprintf("PREOP_FEATS (Yellow/Pink, n=%d): %s",
+                length(PREOP_FEATS), paste(PREOP_FEATS, collapse = ", ")))
+log_msg(sprintf("BLUE_PROCEDURE_FEATS (Blue, n=%d): %s",
+                length(BLUE_PROCEDURE_FEATS), paste(BLUE_PROCEDURE_FEATS, collapse = ", ")))
+log_msg(sprintf("INTRAOP_BP_FEATS (n=%d) / POSTOP_BP_FEATS (n=%d) — BP-derived, listed earlier",
+                length(INTRAOP_BP_FEATS), length(POSTOP_BP_FEATS)))
+
+# CASE CONSTRUCTION — 7 cases: 3 individual + 4 combinations
+#
+# Preop-only, intraop-only, postop-only,
+# preop+intraop, preop+postop, intraop+postop, preop+intraop+postop.
+#
+# README constraint carried through: "Only postoperative feature to use:
+# Blood pressure. ALL OTHERS ARE associated with the outcome" -> POSTOP_BP_FEATS
+# is the only postoperative contribution in any case; Blue procedure features
+# (CAB, Valve, Cardiopulmonary Bypass Time) never appear in a postop-only case.
+
+make_case <- function(feature_cols, require_intraop_bp = FALSE,
+                      require_postop_bp = FALSE, name) {
+  df <- sts_full
+  if (require_intraop_bp) df <- filter(df, has_intraop_bp, !flag_missing_bp)
+  if (require_postop_bp)  df <- filter(df, has_postop_bp,  !flag_missing_bp)
+  df <- select(df, all_of(ID_OUTCOME_COLS), all_of(feature_cols))
+
+  if (nrow(df) == 0) {
+    log_msg(sprintf(
+      paste0("  %-20s     0 patients -- EMPTY COHORT. This case requires ",
+             "%s%s%s BP data, and no patient in this extract satisfies that ",
+             "combination given the current phase definition (hours_from_start ",
+             "vs. actual surgery duration). Downstream scripts must skip this ",
+             "case rather than build a table from it -- check the BP phase ",
+             "distribution log above and confirm with the collaborator whether ",
+             "this reflects a real data gap or a phase-labeling issue."),
+      name,
+      if (require_intraop_bp) "intraop " else "",
+      if (require_intraop_bp && require_postop_bp) "AND " else "",
+      if (require_postop_bp) "postop " else ""))
+  } else {
+    log_msg(sprintf("  %-20s %5d patients | %3d feature cols | PRF=%.2f%%",
+                    name, nrow(df), length(feature_cols), 100 * mean(df$PRF)))
+  }
+  df
+}
+
+log_msg("\n--- Building all 7 analysis cases ---")
+
+ds_preop <- make_case(
+  PREOP_FEATS,
+  name = "preop_only")
+
+ds_intraop <- make_case(
+  c(BLUE_PROCEDURE_FEATS, INTRAOP_BP_FEATS),
+  require_intraop_bp = TRUE,
+  name = "intraop_only")
+
+ds_postop <- make_case(
+  POSTOP_BP_FEATS,
+  require_postop_bp = TRUE,
+  name = "postop_only")
+
+ds_preop_intraop <- make_case(
+  c(PREOP_FEATS, BLUE_PROCEDURE_FEATS, INTRAOP_BP_FEATS),
+  require_intraop_bp = TRUE,
+  name = "preop_intraop")
+
+ds_preop_postop <- make_case(
+  c(PREOP_FEATS, POSTOP_BP_FEATS),
+  require_postop_bp = TRUE,
+  name = "preop_postop")
+
+ds_intraop_postop <- make_case(
+  c(BLUE_PROCEDURE_FEATS, INTRAOP_BP_FEATS, POSTOP_BP_FEATS),
+  require_intraop_bp = TRUE,
+  require_postop_bp = TRUE,
+  name = "intraop_postop")
+
+ds_preop_intraop_postop <- make_case(
+  c(PREOP_FEATS, BLUE_PROCEDURE_FEATS, INTRAOP_BP_FEATS, POSTOP_BP_FEATS),
+  require_intraop_bp = TRUE,
+  require_postop_bp = TRUE,
+  name = "preop_intraop_postop")
+
+# NEW per Dr. Trivedi: Preop + Intraop, but restricted to ONLY MAP-derived
+# intraop BP features (no SBP-derived intraop features, no Blue procedure
+# variables like CAB/Valve/CPB time -- just preop + intraop MAP).
+INTRAOP_MAP_FEATS <- INTRAOP_BP_FEATS[str_detect(INTRAOP_BP_FEATS, "MAP")]
+log_msg(sprintf("INTRAOP_MAP_FEATS (n=%d): %s",
+                length(INTRAOP_MAP_FEATS), paste(INTRAOP_MAP_FEATS, collapse = ", ")))
+
+ds_preop_intraop_map_only <- make_case(
+  c(PREOP_FEATS, INTRAOP_MAP_FEATS),
+  require_intraop_bp = TRUE,
+  name = "preop_intraop_map_only")
+
+# Named list drives the split + pipeline loop below
+ALL_CASES <- list(
+  preop_only              = ds_preop,
+  intraop_only            = ds_intraop,
+  postop_only             = ds_postop,
+  preop_intraop           = ds_preop_intraop,
+  preop_postop            = ds_preop_postop,
+  intraop_postop          = ds_intraop_postop,
+  preop_intraop_postop    = ds_preop_intraop_postop,
+  preop_intraop_map_only  = ds_preop_intraop_map_only
+)
+
+
+
+
+# STEP 13 — Stratified 70/30 train-test split
+
+log_msg("\n--- Step 13: Stratified 70/30 train-test split ---")
+
+make_split <- function(df, name) {
+  n_total <- nrow(df)
+  n_pos   <- sum(df$PRF == 1, na.rm = TRUE)
+  n_neg   <- sum(df$PRF == 0, na.rm = TRUE)
+
+  # createDataPartition needs >=2 total rows, and a stratified 70/30 split
+  # needs >=2 patients in EACH class to be meaningful at all. If a case fails
+  # this, it's because its cohort filter (e.g. requiring BOTH intraop AND
+  # postop BP present) leaves too few patients or only one PRF class.
+  if (n_total < 2 || n_pos < 2 || n_neg < 2) {
+    log_msg(sprintf(
+      paste0("  SKIPPING %-20s -- insufficient data for a stratified split ",
+             "(n=%d total, PRF=1: %d, PRF=0: %d; need >=2 in each class). ",
+             "This case's cohort filter (BP-availability requirement and/or ",
+             "the CABG/Valve + missingness exclusions upstream) is leaving too ",
+             "few patients. Review the case-construction log above for this ",
+             "case's patient count before the split."),
+      name, n_total, n_pos, n_neg))
+    return(NULL)
+  }
+  if (n_pos < 10 || n_neg < 10) {
+    log_msg(sprintf(
+      "  NOTE: %-20s has a very small class (PRF=1: %d, PRF=0: %d) -- split will run, but RUS/SMOTE-NC downstream may behave unpredictably with this few events.",
+      name, n_pos, n_neg))
+  }
+
+  idx   <- createDataPartition(df$PRF, p = 0.70, list = FALSE)
+  train <- df[ idx, ]
+  test  <- df[-idx, ]
+  log_msg(sprintf("  %-22s  train: %d (PRF %.2f%%) | test: %d (PRF %.2f%%)",
+                  name, nrow(train), 100*mean(train$PRF),
+                  nrow(test),  100*mean(test$PRF)))
+  list(train = train, test = test)
+}
+
+ALL_SPLITS <- Map(make_split, ALL_CASES, names(ALL_CASES))
+ALL_SPLITS <- Filter(Negate(is.null), ALL_SPLITS)
+
+if (length(ALL_SPLITS) < length(ALL_CASES)) {
+  skipped <- setdiff(names(ALL_CASES), names(ALL_SPLITS))
+  log_msg(sprintf(
+    "\nNOTE: %d of %d case(s) SKIPPED for the rest of the pipeline due to insufficient data: %s",
+    length(skipped), length(ALL_CASES), paste(skipped, collapse = ", ")))
+  log_msg("      These cases are not modelable with the current cohort as filtered.")
+  log_msg("      Discuss with the collaborator whether the BP-overlap requirement,")
+  log_msg("      CABG/Valve filter, or missingness exclusions need revisiting for them.")
+}
+
+
+
+# PIPELINE FUNCTION — Steps 14–17
+# Applied separately to each of the three dataset splits.
+# Step 14: RUS at 10:1 neg:pos ratio on training set
+# Step 15: Z-score normalisation (fit on post-RUS train; applied to test)
+# Step 16: SMOTE-NC (k=5) — doubles the minority class (Mickey constraint)
+# Step 17: k-1 dummy encoding of all categorical variables
+
+apply_pipeline_steps_14_to_17 <- function(train_raw, test_raw, dataset_name) {
+
+  log_msg(sprintf("\n=== Pipeline Steps 14-17: %s ===", dataset_name))
+
+  # ML training uses the log-transformed Platelet Count only (matches the
+  # originally-approved Step 10 behavior). Raw Platelet Count is kept
+  # upstream for statistics/correlation use but is not an ML feature -- drop
+  # it here if present, so downstream scaling/SMOTE/encoding never sees it.
+  if ("Platelet Count" %in% names(train_raw)) {
+    train_raw <- select(train_raw, -`Platelet Count`)
+    test_raw  <- select(test_raw,  -`Platelet Count`)
+  }
+
+  # Columns excluded from scaling and encoding
+  ID_COLS   <- c("New_MRN", "Surgery_Date", "Surgery_Date_parsed",
+                 "OR Entry Date And Time", "OR Exit Date And Time")
+  FLAG_COLS <- c("flag_missing_bp", "flag_emergent_salvage")
+  OUTCOME   <- "PRF"
+  SKIP_COLS <- c(ID_COLS, FLAG_COLS, OUTCOME)
+
+  # STEP 14: RUS
+  # Target: 70:30 negative:positive AFTER SMOTE-NC doubles the minority class.
+  # the required neg count before SMOTE-NC is:
+  #   n_neg_target / (2 * n_pos) = 70/30
+  #   n_neg_target = (14/3) * n_pos ≈ 4.67 * n_pos
+  
+  n_pos        <- sum(train_raw$PRF == 1)
+  n_neg        <- sum(train_raw$PRF == 0)
+  n_neg_target <- min(n_neg, round(n_pos * (14 / 3)))
+  
+  train_pos <- filter(train_raw, PRF == 1)
+  train_neg <- slice_sample(filter(train_raw, PRF == 0),
+                            n = n_neg_target, replace = FALSE)
+  train_rus <- slice_sample(bind_rows(train_pos, train_neg), prop = 1)
+  
+  log_step(14, sprintf(
+    "RUS: %d pos + %d neg = %d rows | neg:pos = %.1f:1 (targeting 70:30 post-SMOTE-NC)",
+    n_pos, n_neg_target, nrow(train_rus), n_neg_target / n_pos
+  ))
+  # STEP 15: Z-score normalisation
+  # Fit on post-RUS training set; apply same parameters to test set.
+  num_cols_to_scale <- names(train_rus)[
+    sapply(train_rus, is.numeric) & !names(train_rus) %in% SKIP_COLS
+  ]
+  scaler  <- preProcess(train_rus[num_cols_to_scale], method = c("center", "scale"))
+  train_z <- train_rus
+  test_z  <- test_raw
+  train_z[num_cols_to_scale] <- predict(scaler, train_rus[num_cols_to_scale])
+  test_z[num_cols_to_scale]  <- predict(scaler, test_raw[num_cols_to_scale])
+
+  log_step(15, sprintf("Z-score normalisation: %d columns (train params applied to test)",
+                       length(num_cols_to_scale)))
+
+  # Pre-SMOTE-NC imputation
+  # SMOTE-NC requires complete data. Remaining NAs (intermediate missingness
+  # not handled by Steps 3-4) are imputed here using training set statistics.
+  # Same imputation values are applied to the test set.
+  num_na_cols <- names(train_z)[
+    sapply(train_z, is.numeric) &
+    sapply(train_z, function(x) any(is.na(x))) &
+    !names(train_z) %in% SKIP_COLS
+  ]
+  cat_na_cols <- names(train_z)[
+    (sapply(train_z, is.character) | sapply(train_z, is.logical)) &
+    sapply(train_z, function(x) any(is.na(x))) &
+    !names(train_z) %in% SKIP_COLS
+  ]
+
+  impute_medians <- sapply(train_z[num_na_cols], median, na.rm = TRUE)
+  impute_modes   <- sapply(train_z[cat_na_cols], function(x) {
+    tbl <- table(x, useNA = "no")
+    names(tbl)[which.max(tbl)]
+  })
+
+  for (col in num_na_cols) {
+    train_z[[col]][is.na(train_z[[col]])] <- impute_medians[[col]]
+    test_z[[col]][is.na(test_z[[col]])]   <- impute_medians[[col]]
+  }
+  for (col in cat_na_cols) {
+    train_z[[col]][is.na(train_z[[col]])] <- impute_modes[[col]]
+    test_z[[col]][is.na(test_z[[col]])]   <- impute_modes[[col]]
+  }
+
+  if (length(num_na_cols) + length(cat_na_cols) > 0) {
+    log_msg(sprintf("  Pre-SMOTE-NC imputation: %d numeric (median) + %d categorical (mode)",
+                    length(num_na_cols), length(cat_na_cols)))
+    if (length(num_na_cols) > 0)
+      log_msg(sprintf("    Numeric columns imputed (median): %s",
+                      paste(num_na_cols, collapse = ", ")))
+    if (length(cat_na_cols) > 0)
+      log_msg(sprintf("    Categorical columns imputed (mode): %s",
+                      paste(cat_na_cols, collapse = ", ")))
+  }
+
+  # STEP 16: SMOTE-NC — double the minority class
+  # over_ratio = target_minority / majority = (2 * n_pos) / n_neg
+  # This doubles the number of PRF cases (Mickey's approved constraint).
+  # SMOTE-NC handles mixed data: interpolates continuous, copies categorical.
+  # Applied BEFORE dummy encoding so categorical columns are still factors.
+  n_pos_rus        <- sum(train_z$PRF == 1)
+  n_neg_rus        <- sum(train_z$PRF == 0)
+  over_ratio_target <- (2 * n_pos_rus) / n_neg_rus
+
+  log_msg(sprintf("  SMOTE-NC: n_pos=%d | n_neg=%d | over_ratio=%.4f (2x minority)",
+                  n_pos_rus, n_neg_rus, over_ratio_target))
+
+  cat_cols_for_smote <- names(train_z)[
+    (sapply(train_z, is.character) | sapply(train_z, is.logical)) &
+      !names(train_z) %in% SKIP_COLS
+  ]
+
+  # SMOTE-NC needs at least k+1 minority-class rows (it interpolates between
+  # each minority point and its k nearest minority neighbors). Cap k to what's
+  # actually available in this case's training set instead of hardcoding 5,
+  # and skip SMOTE entirely if there isn't even 1 neighbor to interpolate with.
+  k_smote <- min(5, n_pos_rus - 1)
+
+  if (k_smote < 1) {
+    log_msg(sprintf(
+      "  SKIPPING SMOTE-NC: only %d minority (PRF=1) row(s) in training set -- need at least 2. Training set left un-oversampled.",
+      n_pos_rus))
+    train_smoted <- train_z %>%
+      mutate(across(all_of(cat_cols_for_smote), as.factor))
+  } else {
+    if (k_smote < 5)
+      log_msg(sprintf("  NOTE: reducing SMOTE-NC k from 5 to %d (only %d minority rows available)",
+                      k_smote, n_pos_rus))
+
+    # Hard safety net: even with k capped to the available minority count,
+    # themis::smotenc() can still throw "Not enough observations of `1`"
+    # (e.g. if a resampled fold or a categorical level leaves too few usable
+    # neighbors internally). Catch it here so one small case can't abort the
+    # whole 3-case pipeline -- fall back to un-oversampled training data.
+    train_smoted <- tryCatch({
+      train_z %>%
+        mutate(across(all_of(cat_cols_for_smote), as.factor),
+               PRF = as.factor(PRF)) %>%
+        smotenc(var = "PRF", k = k_smote, over_ratio = over_ratio_target) %>%
+        mutate(PRF = as.integer(as.character(PRF)))
+    }, error = function(e) {
+      log_msg(sprintf(
+        "  SMOTE-NC FAILED (%s) -- leaving this case's training set un-oversampled.",
+        conditionMessage(e)))
+      train_z %>% mutate(across(all_of(cat_cols_for_smote), as.factor))
+    })
+  }
+
+  log_step(16, sprintf("SMOTE-NC: %d -> %d rows | PRF=%.2f%% | minority: %d -> %d",
+                       nrow(train_z), nrow(train_smoted),
+                       100 * mean(train_smoted$PRF),
+                       n_pos_rus, sum(train_smoted$PRF)))
+
+  # STEP 17: k-1 dummy encoding
+  # Remove SKIP_COLS before encoding; re-attach PRF after.
+  skip_train <- SKIP_COLS[SKIP_COLS %in% names(train_smoted)]
+  skip_test  <- SKIP_COLS[SKIP_COLS %in% names(test_z)]
+
+  train_prf  <- train_smoted[["PRF"]]
+  test_prf   <- test_z[["PRF"]]
+
+  train_feat <- train_smoted[, !names(train_smoted) %in% c(skip_train, "PRF"), drop = FALSE]
+  test_feat  <- test_z[,      !names(test_z)        %in% c(skip_test,  "PRF"), drop = FALSE]
+
+  for (col in names(train_feat)[sapply(train_feat, is.character)])
+    train_feat[[col]] <- as.factor(train_feat[[col]])
+  for (col in names(test_feat)[sapply(test_feat, is.character)])
+    test_feat[[col]]  <- as.factor(test_feat[[col]])
+
+  train_factor_cols <- names(train_feat)[sapply(train_feat, is.factor)]
+  test_factor_cols  <- names(test_feat)[sapply(test_feat, is.factor)]
+
+  if (length(train_factor_cols) > 0) {
+    train_enc <- dummy_cols(train_feat,
+                            select_columns          = train_factor_cols,
+                            remove_first_dummy      = TRUE,
+                            remove_selected_columns = TRUE)
+  } else {
+    train_enc <- train_feat
+  }
+
+  if (length(test_factor_cols) > 0) {
+    test_enc  <- dummy_cols(test_feat,
+                            select_columns          = test_factor_cols,
+                            remove_first_dummy      = TRUE,
+                            remove_selected_columns = TRUE)
+  } else {
+    test_enc <- test_feat
+  }
+
+  # Add any dummy columns present in train but absent from test (rare category levels)
+  for (col in setdiff(names(train_enc), names(test_enc)))
+    test_enc[[col]] <- 0L
+  test_enc <- test_enc[, names(train_enc), drop = FALSE]
+
+  log_step(17, sprintf("k-1 dummy encoding: %d features", ncol(train_enc)))
+
+  # Attach PRF label as last column
+  train_final <- cbind(train_enc, PRF = train_prf)
+  test_final  <- cbind(test_enc,  PRF = test_prf)
+  rownames(train_final) <- NULL
+  rownames(test_final)  <- NULL
+
+  log_msg(sprintf("  Test PRF: %d events / %d total (%.2f%%)",
+                  sum(test_final$PRF), nrow(test_final), 100*mean(test_final$PRF)))
+  log_step("DONE", sprintf("train: %d rows x %d cols | test: %d rows x %d cols",
+                           nrow(train_final), ncol(train_final),
+                           nrow(test_final),  ncol(test_final)))
+
+  list(train = train_final, test = test_final, scaler = scaler)
+
+}  # end apply_pipeline_steps_14_to_17
+
+
+
+# RUN PIPELINE FOR ALL 3 CASES
+
+ALL_PIPELINES <- Map(
+  function(split, name) apply_pipeline_steps_14_to_17(split$train, split$test, name),
+  ALL_SPLITS, names(ALL_SPLITS)
+)
+
+# Convenience accessors (train/test data frames per case)
+ALL_TRAIN <- lapply(ALL_PIPELINES, `[[`, "train")
+ALL_TEST  <- lapply(ALL_PIPELINES, `[[`, "test")
+
+# Backward-compatible flat aliases. Downstream scripts (e.g.
+# PRF_statistics_and_export_clean.R) still look for train_preop, test_preop,
+# train_intraop, test_intraop, train_postop, test_postop as standalone
+# objects rather than list elements -- provide them here so those scripts
+# don't need to change. If a case was skipped upstream (insufficient data),
+# its alias is simply not created and the downstream script's own
+# missing-object check will catch it.
+if ("preop_only" %in% names(ALL_TRAIN)) {
+  train_preop <- ALL_TRAIN[["preop_only"]]; test_preop <- ALL_TEST[["preop_only"]]
+}
+if ("intraop_only" %in% names(ALL_TRAIN)) {
+  train_intraop <- ALL_TRAIN[["intraop_only"]]; test_intraop <- ALL_TEST[["intraop_only"]]
+}
+if ("postop_only" %in% names(ALL_TRAIN)) {
+  train_postop <- ALL_TRAIN[["postop_only"]]; test_postop <- ALL_TEST[["postop_only"]]
+}
+
+
+
+# SAVE OUTPUTS
+
+log_msg("\n--- Saving outputs ---")
+
+save(ALL_CASES, ALL_SPLITS, ALL_PIPELINES, ALL_TRAIN, ALL_TEST,
+     list = intersect(c("train_preop","test_preop","train_intraop",
+                        "test_intraop","train_postop","test_postop"),
+                      ls()),
+     file = "prf_preprocessed.RData")
+
+for (case_name in names(ALL_PIPELINES)) {
+  write.csv(ALL_TRAIN[[case_name]],
+            sprintf("train_%s.csv", case_name), row.names = FALSE)
+  write.csv(ALL_TEST[[case_name]],
+            sprintf("test_%s.csv",  case_name), row.names = FALSE)
+}
+
+writeLines(LOG, "prf_preprocessing_log.txt")
+
+# Save full workspace so future sessions can reload without re-running
+save.image("prf_workspace.RData")
+
+log_msg("Saved: prf_preprocessed.RData")
+log_msg(sprintf("Saved: train/test CSVs (%d files, %d cases)", 2 * length(ALL_PIPELINES), length(ALL_PIPELINES)))
+log_msg("Saved: prf_preprocessing_log.txt")
+log_msg("Saved: prf_workspace.RData (reload with: load('prf_workspace.RData'))")
+
+
+
+# FINAL SUMMARY
+log_msg("  PREPROCESSING COMPLETE  |  7 cases (3 individual + 4 combinations)")
+
+for (case_name in names(ALL_PIPELINES)) {
+  tr <- ALL_TRAIN[[case_name]]; te <- ALL_TEST[[case_name]]
+  log_msg(sprintf("  %-22s  train: %4d rows x %3d cols  PRF=%.2f%%  |  test: %4d rows x %3d cols  PRF=%.2f%%",
+                  case_name,
+                  nrow(tr), ncol(tr), 100 * mean(tr$PRF),
+                  nrow(te), ncol(te), 100 * mean(te$PRF)))
+}
+
+log_msg(paste("\nCompleted:", format(Sys.time())))
