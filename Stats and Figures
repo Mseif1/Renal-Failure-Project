@@ -1,0 +1,653 @@
+# PRF STATISTICAL SUMMARY & ML DATASET EXPORT
+# University of Louisville  |  Renal Failure Project 2026
+#0. PACKAGES
+required_pkgs <- c("dplyr", "stringr", "gtsummary", "labelled",
+                   "openxlsx", "writexl", "fastDummies")
+
+invisible(lapply(required_pkgs, function(p) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+  library(p, character.only = TRUE)
+}))
+
+setwd("~/Desktop/Projects/Renal Failure project")
+
+cat("=== PRF Statistical Summary & ML Dataset Export ===\n")
+cat("Timestamp:", format(Sys.time()), "\n\n")
+
+
+
+# 1. VERIFY REQUIRED OBJECTS ARE IN ENVIRONMENT
+
+cat("--- Checking required objects ---\n")
+
+if (!all(sapply(c("ALL_CASES", "ALL_TRAIN", "ALL_TEST"), exists))) {
+  stop(paste(
+    "Missing ALL_CASES / ALL_TRAIN / ALL_TEST.",
+    "Run the current PRF_preprocessing_v3.R first, or load('prf_workspace.RData').",
+    "(This script was reworked to use the multi-case list structure -- it no",
+    "longer looks for flat ds_preop/train_preop-style objects.)"
+  ))
+}
+
+# Human-readable label + composition description for each possible case.
+# Used for captions, sheet titles, and filenames throughout this script.
+CASE_INFO <- list(
+  preop_only = list(
+    label = "Preoperative",
+    file_tag = "Preop",
+    desc = "Preoperative variables only"),
+  intraop_only = list(
+    label = "Intraoperative",
+    file_tag = "Intraop",
+    desc = "Intraoperative procedure variables (CAB, Valve, CPB time) + intraoperative blood pressure only -- no preoperative variables"),
+  postop_only = list(
+    label = "Postoperative",
+    file_tag = "Postop",
+    desc = "Postoperative blood pressure only -- no preoperative or intraoperative variables"),
+  preop_intraop = list(
+    label = "Preop + Intraop",
+    file_tag = "Preop_Intraop",
+    desc = "Preoperative variables + intraoperative procedure variables and blood pressure"),
+  preop_postop = list(
+    label = "Preop + Postop",
+    file_tag = "Preop_Postop",
+    desc = "Preoperative variables + postoperative blood pressure"),
+  intraop_postop = list(
+    label = "Intraop + Postop",
+    file_tag = "Intraop_Postop",
+    desc = "Intraoperative procedure variables/blood pressure + postoperative blood pressure"),
+  preop_intraop_postop = list(
+    label = "Preop + Intraop + Postop",
+    file_tag = "Preop_Intraop_Postop",
+    desc = "All preoperative, intraoperative, and postoperative (blood pressure) variables"),
+  preop_intraop_map_only = list(
+    label = "Preop + Intraop (MAP only)",
+    file_tag = "Preop_Intraop_MAPonly",
+    desc = "Preoperative variables + MAP-derived intraoperative blood pressure only -- no SBP-derived intraop features, no procedure variables (per Dr. Trivedi)")
+)
+
+# Cases actually present (ds-level, always all 7 unless the preprocessing
+# script itself was edited) vs. cases with a usable train/test split
+# (may be fewer than the full case count if a case was skipped for insufficient data).
+cases_present <- intersect(names(CASE_INFO), names(ALL_CASES))
+cases_split   <- intersect(cases_present, intersect(names(ALL_TRAIN), names(ALL_TEST)))
+cases_skipped <- setdiff(cases_present, cases_split)
+
+cat(sprintf("Found %d of %d expected cases in ALL_CASES: %s\n",
+            length(cases_present), length(CASE_INFO), paste(cases_present, collapse = ", ")))
+
+for (cn in cases_present) {
+  df <- ALL_CASES[[cn]]
+  cat(sprintf("  %-22s %5d rows x %3d cols | PRF=%.2f%%\n",
+              cn, nrow(df), ncol(df), 100 * mean(df$PRF)))
+}
+
+if (length(cases_skipped) > 0) {
+  cat(sprintf(
+    "\nNOTE: %d case(s) have no train/test split (skipped upstream for insufficient data): %s\n",
+    length(cases_skipped), paste(cases_skipped, collapse = ", ")))
+  cat("      Table 1 statistics will still be produced for these (real-data only);\n")
+  cat("      ML train/test exports will be skipped for them.\n")
+}
+
+# Cases with at least 1 row AND both PRF classes present. A case requiring
+# BOTH intraop and postop BP (intraop_postop, preop_intraop_postop) can
+# legitimately be EMPTY if no patient in the data has both phases of BP
+# recorded -- gtsummary's add_p()/modify_footnote(), dummy_cols(), etc. all
+# error out on a 0-row/0-col data frame or a single-class outcome, so these
+# are excluded from every table-building and pre-split-export step below
+# (they still show up in the Dataset Summary sheet with their real N, even
+# if 0, for transparency).
+cases_empty <- cases_present[sapply(cases_present, function(cn) {
+  df <- ALL_CASES[[cn]]
+  nrow(df) < 1 || length(unique(df$PRF)) < 2
+})]
+cases_nonempty <- setdiff(cases_present, cases_empty)
+
+if (length(cases_empty) > 0) {
+  cat(sprintf(
+    "\nNOTE: %d case(s) are EMPTY or single-class and will be excluded from Table 1 / pre-split exports: %s\n",
+    length(cases_empty), paste(cases_empty, collapse = ", ")))
+  cat("      This should be rare with the current duration-based BP phase definition --\n")
+  cat("      if it occurs, check the BP phase distribution in the preprocessing log and\n")
+  cat("      confirm with the collaborator whether it reflects a real data gap.\n")
+}
+
+cat("\nAll required objects found.\n")
+
+
+
+# 2. PREPARE DATA FOR STATISTICS
+
+# Statistics are ALWAYS computed on the real (pre-oversampling) ALL_CASES
+# datasets. The oversampled ALL_TRAIN datasets contain synthetic SMOTE-NC
+# rows and must never be used for descriptive statistics or Table 1.
+cat("\n--- Preparing data for gtsummary ---\n")
+
+# Non-clinical columns to drop before summarising
+DROP_FOR_SUMMARY <- c("New_MRN", "Surgery_Date", "Surgery_Date_parsed",
+                      "OR Entry Date And Time", "OR Exit Date And Time",
+                      "flag_missing_bp", "flag_emergent_salvage",
+                      "creatinine_baseline", "has_intraop_bp", "has_postop_bp",
+                      # Preprocessing now keeps BOTH raw Platelet Count and
+                      # Platelet_Count_log flowing through (log version is
+                      # ML-only). Table 1 is real, un-split, un-oversampled
+                      # data -- use raw platelet count for readability;
+                      # drop the log version here.
+                      "Platelet_Count_log")
+
+prepare_for_summary <- function(df, label) {
+  df <- df %>%
+    select(-any_of(DROP_FOR_SUMMARY)) %>%
+    mutate(
+      PRF = factor(PRF, levels = c(0, 1), labels = c("No PRF", "PRF")),
+      across(where(is.character), as.factor)
+    )
+  cat(sprintf("  %-22s %d rows, %d variables\n", label, nrow(df), ncol(df) - 1))
+  df
+}
+
+# Variable labels for clean Table 1 display.
+# NOTE: MELD Score is dropped upstream in the current preprocessing script
+# (per README/email instruction) and will never actually appear in any case's
+# data -- its label entry below is harmless dead code, kept only in case a
+# future version of the pipeline restores it.
+VAR_LABELS <- list(
+  # Demographics
+  `Patient Age`                                          = "Age (years)",
+  Sex                                                    = "Sex",
+  Race                                                   = "Race",
+  `Hispanic or Latino or Spanish Ethnicity`              = "Hispanic/Latino Ethnicity",
+  BMI                                                    = "BMI (kg/m²)",
+  # Labs
+  `Last Creatinine Level`                                = "Creatinine (mg/dL)",
+  `Total Albumin`                                        = "Albumin (g/dL)",
+  `Total Bilirubin`                                      = "Total Bilirubin (mg/dL)",
+  `WBC Count`                                            = "WBC Count (cells/\u03bcL)",
+  Hemoglobin                                             = "Hemoglobin (g/dL)",
+  Platelet_Count_log                                     = "Platelet Count (log) [ML only, not in Table 1]",
+  `Platelet Count`                                       = "Platelet Count",
+  Sodium                                                 = "Sodium (mEq/L)",
+  INR                                                    = "INR",
+  `MELD Score`                                           = "MELD Score",
+  `Hemo Data-EF`                                         = "Ejection Fraction (%)",
+  # Comorbidities
+  `RF-Diabetes`                                          = "Diabetes",
+  `RF-Hypertension`                                      = "Hypertension",
+  `RF- Endocarditis`                                     = "Endocarditis",
+  `RF-Liver Disease`                                     = "Liver Disease",
+  `RF-Liver Cirrhosis`                                   = "Liver Cirrhosis",
+  `Immunocompromised Present`                            = "Immunocompromised",
+  `Peripheral Artery Disease`                            = "Peripheral Artery Disease",
+  `Cerebrovascular Disease`                              = "Cerebrovascular Disease",
+  `Cancer Within 5 Years`                                = "Cancer Within 5 Years",
+  `RF-Sleep Apnea`                                       = "Sleep Apnea",
+  `RF-Pneumonia`                                         = "Pneumonia",
+  `RF-Home Oxygen`                                       = "Home Oxygen Use",
+  `RF-Inhaled Medication or Oral Bronchodilator Therapy` = "Inhaled/Oral Bronchodilator",
+  Syncope                                                = "Syncope",
+  CLD_Combined                                           = "Chronic Lung Disease (Combined)",
+  # Lifestyle
+  `RF-Tobacco Use`                                       = "Tobacco Use",
+  # Cardiac
+  `Heart Failure`                                        = "Heart Failure",
+  `Classification-NYHA`                                  = "NYHA Classification",
+  `Cardiogenic Shock`                                    = "Cardiogenic Shock",
+  Resuscitation                                          = "Resuscitation",
+  `Cardiac Arrhythmia`                                   = "Cardiac Arrhythmia",
+  `Prior MI`                                             = "Prior MI",
+  `Prev Cardiac Interventions`                           = "Prior Cardiac Interventions",
+  Incidence                                              = "Operative Incidence",
+  Status                                                 = "Operative Status",
+  # Medications
+  `Meds-ACE Inhibitors or ARB Within 48 Hours`           = "ACE Inhibitor/ARB (48h)",
+  `Meds-Beta Blockers Within 24 Hours`                   = "Beta Blocker (24h)",
+  `Meds-ADP Inhibitors Within Five Days`                 = "ADP Inhibitor (5 days)",
+  `Meds-Aspirin Within Five Days`                        = "Aspirin (5 days)",
+  `Meds-Anticoagulants Within 48 Hours`                  = "Anticoagulant (48h)",
+  `Meds-Inotropes Within 48 Hours`                       = "Inotropes (48h)",
+  `Meds-Steroids Within 24 Hours`                        = "Steroids (24h)",
+  # Procedure
+  CAB                                                    = "Coronary Artery Bypass",
+  Valve                                                  = "Valve Procedure",
+  `Cardiopulmonary Bypass Time`                          = "CPB Time (minutes)",
+  `Lowest Intra-op Hemoglobin`                           = "Lowest Intraop Hemoglobin (g/dL)",
+  `Highest Intra-op Glucose`                             = "Highest Intraop Glucose (mg/dL)"
+)
+
+apply_labels <- function(df) {
+  existing <- VAR_LABELS[names(VAR_LABELS) %in% names(df)]
+  var_label(df) <- existing
+  df
+}
+
+summary_dfs <- list()
+for (cn in cases_nonempty) {
+  summary_dfs[[cn]] <- prepare_for_summary(ALL_CASES[[cn]], CASE_INFO[[cn]]$label)
+}
+
+
+
+# 3. BUILD GTSUMMARY TABLES
+
+cat("\n--- Building gtsummary tables ---\n")
+
+build_summary_table <- function(df, dataset_label, dataset_desc) {
+  cat(sprintf("  Building: %s\n", dataset_label))
+
+  df  <- apply_labels(df)
+  num_cols <- names(df)[sapply(df, is.numeric)   & names(df) != "PRF"]
+  cat_cols <- names(df)[sapply(df, function(x) is.factor(x) | is.character(x)) &
+                           names(df) != "PRF"]
+
+  df %>%
+    tbl_summary(
+      by           = PRF,
+      missing      = "ifany",
+      missing_text = "Missing",
+      type         = list(all_of(num_cols) ~ "continuous",
+                          all_of(cat_cols) ~ "categorical"),
+      statistic    = list(all_continuous()  ~ "{median} ({p25}, {p75})",
+                          all_categorical() ~ "{n} ({p}%)"),
+      digits       = list(all_continuous()  ~ 2,
+                          all_categorical() ~ c(0, 1))
+    ) %>%
+    add_p(
+      test       = list(all_continuous()  ~ "wilcox.test",
+                        all_categorical() ~ "chisq.test"),
+      pvalue_fun = ~style_pvalue(., digits = 3)
+    ) %>%
+    add_overall() %>%
+    add_n() %>%
+    bold_p(t = 0.05) %>%
+    bold_labels() %>%
+    modify_header(
+      label   ~ "**Variable**",
+      stat_0  ~ "**Overall**\nN = {N}",
+      stat_1  ~ "**No PRF**\nN = {n}",
+      stat_2  ~ "**PRF**\nN = {n}",
+      p.value ~ "**p-value**"
+    ) %>%
+    modify_caption(sprintf(
+      "**Table 1. Baseline Characteristics by PRF Status — %s Dataset**\n(%s)",
+      dataset_label, dataset_desc
+    )) %>%
+    modify_footnote(
+      all_stat_cols() ~
+        "Continuous: Median (Q1, Q3). Categorical: n (%). Wilcoxon rank-sum for continuous; Chi-square or Fisher exact for categorical."
+    )
+}
+
+tbls <- list()
+for (cn in cases_nonempty) {
+  tbls[[cn]] <- build_summary_table(
+    summary_dfs[[cn]], CASE_INFO[[cn]]$label, CASE_INFO[[cn]]$desc)
+}
+cat(sprintf("  All %d table(s) built.\n", length(tbls)))
+
+
+
+# 4. EXPORT STATISTICS TO EXCEL
+
+cat("\n--- Exporting statistics to Excel ---\n")
+
+tbl_to_df <- function(tbl) {
+  as_tibble(tbl) %>%
+    mutate(across(everything(), ~str_remove_all(as.character(.), "<[^>]+>")))
+}
+
+stat_dfs <- lapply(tbls, tbl_to_df)
+
+# Styles
+header_style <- createStyle(
+  fontName = "Arial", fontSize = 11, fontColour = "#FFFFFF",
+  fgFill   = "#1B3A6B", halign = "CENTER", valign = "CENTER",
+  textDecoration = "bold", wrapText = TRUE
+)
+even_row_style <- createStyle(fgFill = "#D6E4F7")
+sig_style      <- createStyle(fontColour = "#A0364A", textDecoration = "bold")
+title_style <- createStyle(
+  fontName = "Arial", fontSize = 14, fontColour = "#1B3A6B",
+  textDecoration = "bold"
+)
+
+# Helper: write one statistics sheet
+write_stats_sheet <- function(wb, sheet_name, df, title_text, tab_colour = "1B3A6B") {
+
+  addWorksheet(wb, sheet_name, tabColour = tab_colour)
+
+  writeData(wb, sheet_name, title_text, startRow = 1, startCol = 1)
+  addStyle(wb, sheet_name, title_style, rows = 1, cols = 1)
+
+  writeData(wb, sheet_name,
+            paste("Statistics on real patient data (pre-oversampling).",
+                  "Continuous: Median (Q1, Q3). Categorical: n (%).",
+                  "Wilcoxon rank-sum | Chi-square / Fisher exact.",
+                  "Bold p < 0.05."),
+            startRow = 2, startCol = 1)
+
+  writeData(wb, sheet_name, df,
+            startRow = 4, startCol = 1,
+            headerStyle = header_style,
+            borders = "all", borderStyle = "thin")
+
+  n_rows <- nrow(df)
+  n_cols <- ncol(df)
+
+  # Alternating row shading
+  for (r in seq(5, 4 + n_rows, by = 2))
+    addStyle(wb, sheet_name, even_row_style,
+             rows = r, cols = 1:n_cols, stack = TRUE)
+
+  setColWidths(wb, sheet_name, cols = 1,        widths = 45)
+  setColWidths(wb, sheet_name, cols = 2:n_cols, widths = 16)
+  freezePane(wb,  sheet_name, firstActiveRow = 5, firstActiveCol = 2)
+
+  # Highlight significant p-values
+  p_col <- which(names(df) == "p.value")
+  if (length(p_col) > 0) {
+    for (r in seq_len(n_rows)) {
+      p_val <- suppressWarnings(as.numeric(df[[p_col]][r]))
+      if (!is.na(p_val) && p_val < 0.05)
+        addStyle(wb, sheet_name, sig_style, rows = 4 + r, cols = p_col, stack = TRUE)
+    }
+  }
+
+  invisible(NULL)
+}
+
+# A distinct tab colour per case so the 7 sheets are easy to tell apart
+TAB_COLOURS <- c(
+  preop_only              = "#1B3A6B",
+  intraop_only            = "#1A7A76",
+  postop_only             = "#A0364A",
+  preop_intraop           = "#2E7D32",
+  preop_postop            = "#6A1B9A",
+  intraop_postop          = "#EF6C00",
+  preop_intraop_postop    = "#37474F",
+  preop_intraop_map_only  = "#0F9B8E"
+)
+
+stats_wb <- createWorkbook()
+
+for (cn in cases_nonempty) {
+  write_stats_sheet(
+    stats_wb, CASE_INFO[[cn]]$label, stat_dfs[[cn]],
+    sprintf("Table 1. Baseline Characteristics — %s Dataset (%s)",
+            CASE_INFO[[cn]]$label, CASE_INFO[[cn]]$desc),
+    tab_colour = TAB_COLOURS[[cn]]
+  )
+}
+
+if (length(cases_empty) > 0) {
+  cat(sprintf("  Skipped Table 1 sheet(s) for empty case(s): %s\n",
+              paste(cases_empty, collapse = ", ")))
+}
+
+# Dataset summary sheet -- one row per case, all 7 if present
+addWorksheet(stats_wb, "Dataset Summary", tabColour = "#C97316")
+
+safe_pct <- function(prf_vec) {
+  if (length(prf_vec) == 0) return(NA_real_)
+  round(100 * mean(prf_vec), 2)
+}
+
+summary_data <- data.frame(
+  Dataset          = sapply(cases_present, function(cn) CASE_INFO[[cn]]$label),
+  `Total N`        = sapply(cases_present, function(cn) nrow(ALL_CASES[[cn]])),
+  `PRF N`          = sapply(cases_present, function(cn) sum(ALL_CASES[[cn]]$PRF)),
+  `No PRF N`       = sapply(cases_present, function(cn) sum(ALL_CASES[[cn]]$PRF == 0)),
+  `PRF %`          = sapply(cases_present, function(cn) safe_pct(ALL_CASES[[cn]]$PRF)),
+  `Train N (SMOTE)`= sapply(cases_present, function(cn) if (cn %in% cases_split) nrow(ALL_TRAIN[[cn]]) else NA),
+  `Train PRF %`    = sapply(cases_present, function(cn) if (cn %in% cases_split) safe_pct(ALL_TRAIN[[cn]]$PRF) else NA),
+  `Test N (real)`  = sapply(cases_present, function(cn) if (cn %in% cases_split) nrow(ALL_TEST[[cn]]) else NA),
+  `Test PRF %`     = sapply(cases_present, function(cn) if (cn %in% cases_split) safe_pct(ALL_TEST[[cn]]$PRF) else NA),
+  `N Features`     = sapply(cases_present, function(cn) if (cn %in% cases_split) ncol(ALL_TRAIN[[cn]]) - 1 else ncol(ALL_CASES[[cn]]) - 1),
+  `Split Available`= sapply(cases_present, function(cn) cn %in% cases_split),
+  check.names      = FALSE,
+  stringsAsFactors = FALSE
+)
+
+writeData(stats_wb, "Dataset Summary",
+          "PRF Analysis — Dataset Summary (3 individual + 4 combinations + 1 MAP-only variant)",
+          startRow = 1, startCol = 1)
+addStyle(stats_wb, "Dataset Summary", title_style, rows = 1, cols = 1)
+writeData(stats_wb, "Dataset Summary", summary_data,
+          startRow = 3, startCol = 1,
+          headerStyle = header_style, borders = "all")
+setColWidths(stats_wb, "Dataset Summary",
+             cols = 1:ncol(summary_data), widths = 22)
+
+# Explanatory note for any case with 0 patients, so a reader of the
+# spreadsheet (not just the console log) understands why Total N = 0 --
+# this is a real data limitation (no patient has both intraop AND postop BP
+# recorded in MEAN_BP_first48h_deid.csv), not a processing error.
+zero_n_cases <- cases_present[sapply(cases_present, function(cn) nrow(ALL_CASES[[cn]]) == 0)]
+if (length(zero_n_cases) > 0) {
+  note_row <- 3 + nrow(summary_data) + 2
+  writeData(stats_wb, "Dataset Summary",
+            sprintf(paste0(
+              "Note: %s show Total N = 0. This should be rare under the current ",
+              "duration-based BP phase definition (hours_from_start vs. actual ",
+              "surgery duration) -- check the preprocessing log's BP phase ",
+              "distribution and confirm with the collaborator whether this ",
+              "reflects a real data gap rather than a processing error."
+            ), paste(sapply(zero_n_cases, function(cn) CASE_INFO[[cn]]$label), collapse = " and ")),
+            startRow = note_row, startCol = 1)
+}
+
+saveWorkbook(stats_wb, "PRF_Statistics_Table1.xlsx", overwrite = TRUE)
+cat("  Saved: PRF_Statistics_Table1.xlsx\n")
+
+
+
+# 5. EXPORT ML-READY DATASETS TO EXCEL
+#    One train + one test file per case that has a usable split.
+#    PRF column stored as character ("No_PRF" / "PRF") not integer (0/1).
+cat("\n--- Exporting ML-ready datasets ---\n")
+
+# Convert PRF integer column to descriptive character labels
+label_prf <- function(df) {
+  df %>% mutate(PRF = ifelse(PRF == 1, "PRF", "No_PRF"))
+}
+
+write_ml_excel <- function(df, filename) {
+
+  df <- label_prf(df)
+
+  # Column dictionary as a companion sheet
+  col_dict <- data.frame(
+    Column_Index = seq_len(ncol(df)),
+    Column_Name  = names(df),
+    Is_Outcome   = ifelse(names(df) == "PRF", "YES — predict this", ""),
+    stringsAsFactors = FALSE
+  )
+
+  write_xlsx(
+    list(Data              = df,
+         Column_Dictionary = col_dict),
+    path = filename
+  )
+
+  cat(sprintf("  Saved: %-45s  %d rows x %d cols  PRF=%.2f%%\n",
+              filename, nrow(df), ncol(df),
+              100 * mean(df$PRF == "PRF")))
+}
+
+ml_train_files <- character(0)
+ml_test_files  <- character(0)
+
+for (cn in cases_split) {
+  tag        <- CASE_INFO[[cn]]$file_tag
+  train_file <- sprintf("PRF_Train_%s.xlsx", tag)
+  test_file  <- sprintf("PRF_Test_%s.xlsx",  tag)
+  write_ml_excel(ALL_TRAIN[[cn]], train_file)
+  write_ml_excel(ALL_TEST[[cn]],  test_file)
+  ml_train_files <- c(ml_train_files, train_file)
+  ml_test_files  <- c(ml_test_files,  test_file)
+}
+
+if (length(cases_skipped) > 0) {
+  cat(sprintf("  Skipped ML export for: %s (no train/test split available)\n",
+              paste(cases_skipped, collapse = ", ")))
+}
+
+
+
+# 6. PRE-SPLIT DATASETS
+#    Two versions of each case's real (pre-split, pre-oversampling) data.
+#
+#    Raw:     categorical variables kept as text — for inspection and
+#             descriptive use. Suitable for non-ML workflows.
+#    Encoded: k-1 dummy encoding applied — numerically ready for ML tools
+#             that expect a fully numeric matrix but no normalisation or
+#             oversampling applied.
+#
+#    PRF stored as "PRF" / "No_PRF" in both versions.
+#    New_MRN retained for patient-level tracking.
+#    Operational date/time columns removed.
+#    Built for all cases in ALL_CASES (this doesn't depend on the
+#    train/test split, so it's unaffected by any skipped case).
+cat("\n--- Exporting pre-split datasets ---\n")
+
+# Columns that are operational only and not needed in the analysis files
+DROP_OPERATIONAL <- c("Surgery_Date", "Surgery_Date_parsed",
+                      "OR Entry Date And Time", "OR Exit Date And Time",
+                      # These pre-split exports are for correlation/statistical
+                      # analysis on real, un-oversampled data -- keep raw
+                      # Platelet Count (more clinically interpretable) and
+                      # drop the ML-only log-transformed version.
+                      "Platelet_Count_log")
+
+# Helper: clean and label a pre-split dataset
+clean_presplit <- function(df) {
+  df %>%
+    select(-any_of(DROP_OPERATIONAL)) %>%
+    mutate(PRF = ifelse(PRF == 1, "PRF", "No_PRF"))
+}
+
+# Helper: k-1 dummy encode a pre-split dataset
+encode_presplit <- function(df) {
+  # Separate PRF and New_MRN before encoding; reattach after
+  prf_col    <- df$PRF
+  mrn_col    <- df$New_MRN
+  feat_df    <- select(df, -PRF, -New_MRN)
+
+  # Convert character columns to factors for dummy_cols
+  feat_df <- mutate(feat_df, across(where(is.character), as.factor))
+
+  factor_cols <- names(feat_df)[sapply(feat_df, is.factor)]
+
+  if (length(factor_cols) > 0) {
+    feat_df <- dummy_cols(feat_df,
+                          select_columns          = factor_cols,
+                          remove_first_dummy      = TRUE,
+                          remove_selected_columns = TRUE)
+  }
+
+  # Reattach New_MRN and PRF
+  bind_cols(data.frame(New_MRN = mrn_col), feat_df, data.frame(PRF = prf_col))
+}
+
+presplit_raw <- list()
+presplit_enc <- list()
+for (cn in cases_nonempty) {
+  presplit_raw[[cn]] <- clean_presplit(ALL_CASES[[cn]])
+  presplit_enc[[cn]] <- encode_presplit(presplit_raw[[cn]])
+}
+
+if (length(cases_empty) > 0) {
+  cat(sprintf("  Skipped pre-split export for empty case(s): %s\n",
+              paste(cases_empty, collapse = ", ")))
+}
+
+# Sheet names must be <=31 chars and unique -- CASE_INFO labels all qualify
+raw_sheets <- setNames(presplit_raw, sapply(cases_nonempty, function(cn) CASE_INFO[[cn]]$label))
+enc_sheets <- setNames(presplit_enc, sapply(cases_nonempty, function(cn) CASE_INFO[[cn]]$label))
+
+write_xlsx(raw_sheets, path = "PRF_PreSplit_Raw.xlsx")
+cat(sprintf("  Saved: PRF_PreSplit_Raw.xlsx       (%d KB)  — categorical columns as text\n",
+            round(file.size("PRF_PreSplit_Raw.xlsx") / 1024)))
+for (cn in cases_nonempty) {
+  df <- presplit_raw[[cn]]
+  cat(sprintf("    %-22s %5d rows x %3d cols | PRF: %d events (%.2f%%)\n",
+              CASE_INFO[[cn]]$label, nrow(df), ncol(df),
+              sum(df$PRF == "PRF"), 100 * mean(df$PRF == "PRF")))
+}
+
+write_xlsx(enc_sheets, path = "PRF_PreSplit_Encoded.xlsx")
+cat(sprintf("  Saved: PRF_PreSplit_Encoded.xlsx   (%d KB)  — k-1 dummy encoded\n",
+            round(file.size("PRF_PreSplit_Encoded.xlsx") / 1024)))
+for (cn in cases_nonempty) {
+  df <- presplit_enc[[cn]]
+  cat(sprintf("    %-22s %5d rows x %3d cols\n", CASE_INFO[[cn]]$label, nrow(df), ncol(df)))
+}
+
+# Also write each case as its own standalone flat CSV -- same content as the
+# "Raw" sheet above, but one file per case rather than bundled into a single
+# multi-sheet workbook. This is the format needed for handing a specific
+# case directly to a downstream ML job (e.g. preop_intraop_map_only.csv for
+# Dr. Trivedi's MAP-only Preop+Intraop request) or for the correlation/
+# statistical-analysis scripts, which expect one dataset file per case
+# rather than a sheet reference inside a workbook.
+dir.create("case_datasets", showWarnings = FALSE)
+cat("\n  Flat per-case CSVs (case_datasets/):\n")
+for (cn in cases_nonempty) {
+  df <- presplit_raw[[cn]]
+  out_path <- file.path("case_datasets", sprintf("%s.csv", cn))
+  write.csv(df, out_path, row.names = FALSE)
+  cat(sprintf("    %-22s -> %-45s %5d rows x %3d cols | PRF: %d events (%.2f%%)\n",
+              cn, out_path, nrow(df), ncol(df),
+              sum(df$PRF == "PRF"), 100 * mean(df$PRF == "PRF")))
+}
+if (length(cases_empty) > 0) {
+  cat(sprintf("    (skipped empty case(s): %s)\n", paste(cases_empty, collapse = ", ")))
+}
+
+
+
+# 7. FINAL SUMMARY
+
+cat("\n=============================================\n")
+cat("  EXPORT COMPLETE\n")
+cat("=============================================\n")
+
+cat(sprintf("\n  PRF_Statistics_Table1.xlsx  %d KB  (%d case sheet(s) + Dataset Summary)\n",
+            round(file.size("PRF_Statistics_Table1.xlsx") / 1024), length(cases_nonempty)))
+
+if (length(ml_train_files) > 0) {
+  cat(sprintf("\n  ML train/test exports (%d of %d cases had a usable split):\n",
+              length(cases_split), length(cases_present)))
+  for (i in seq_along(ml_train_files)) {
+    cat(sprintf("    %-30s %5d KB\n", ml_train_files[i], round(file.size(ml_train_files[i]) / 1024)))
+    cat(sprintf("    %-30s %5d KB\n", ml_test_files[i],  round(file.size(ml_test_files[i])  / 1024)))
+  }
+} else {
+  cat("\n  No cases had a usable train/test split -- no ML train/test files exported.\n")
+}
+
+cat(sprintf("\n  PRF_PreSplit_Raw.xlsx       %d KB  (%d sheets)\n",
+            round(file.size("PRF_PreSplit_Raw.xlsx") / 1024), length(cases_nonempty)))
+cat(sprintf("  PRF_PreSplit_Encoded.xlsx   %d KB  (%d sheets)\n",
+            round(file.size("PRF_PreSplit_Encoded.xlsx") / 1024), length(cases_nonempty)))
+cat(sprintf("  case_datasets/*.csv         %d flat per-case CSVs (whole dataset, pre-split, no oversampling)\n",
+            length(cases_nonempty)))
+
+cat("\nKey reminders:\n")
+cat("  1. Table 1 uses REAL patient data only — never oversampled.\n")
+cat("  2. Training sets contain SMOTE-NC synthetic rows — ML use only.\n")
+cat("  3. Test sets contain REAL patients at natural PRF prevalence.\n")
+cat("  4. PRF is always the last column in every ML dataset sheet.\n")
+cat("  5. Row 1 of each ML sheet is a metadata note, not a patient record.\n")
+if (length(cases_skipped) > 0) {
+  cat(sprintf("  6. %d case(s) had no train/test split due to insufficient data: %s.\n",
+              length(cases_skipped), paste(cases_skipped, collapse = ", ")))
+  cat("     Table 1 for these cases still reflects real (if small) patient counts.\n")
+}
+if (length(cases_empty) > 0) {
+  cat(sprintf("  7. %d case(s) are completely EMPTY (0 patients): %s.\n",
+              length(cases_empty), paste(cases_empty, collapse = ", ")))
+  cat("     No Table 1, no pre-split export, no ML export for these -- likely because\n")
+  cat("     no patient has BP recorded in all of the required phases simultaneously.\n")
+}
+cat(sprintf("\nCompleted: %s\n", format(Sys.time())))
