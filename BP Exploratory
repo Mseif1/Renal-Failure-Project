@@ -1,0 +1,339 @@
+# Exploratory BP comparisons by postoperative renal failure (PRF) status.
+# Uses the final analytic cohort with both intraoperative and postoperative BP
+# (ALL_CASES$intraop_postop) and the same phase definitions/first-three-reading
+# exclusion used in PRF_preprocessing_v4.R.  This is descriptive, unadjusted work.
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+  library(readr)
+})
+
+OUT_DIR <- "PRF_BP_exploratory_results"
+dir.create(OUT_DIR, showWarnings = FALSE)
+
+load("prf_preprocessed.RData")
+cohort <- ALL_CASES$intraop_postop %>%
+  transmute(New_MRN, Surgery_Date = as.character(Surgery_Date), PRF = as.integer(PRF))
+
+bp <- read_csv("MEAN_BP_first48h_deid_729.csv", show_col_types = FALSE) %>%
+  mutate(
+    New_MRN = as.numeric(New_MRN),
+    Surgery_Date = as.character(Surgery_Date),
+    bp_phase = case_when(
+      bp_id == "ANES_BP" ~ "Intraoperative",
+      bp_id %in% c("SBP&DBP_Art", "MAP_BMDI") ~ "Postoperative",
+      TRUE ~ NA_character_
+    ),
+    meas_dt = as.POSIXct(meas_dt)
+  ) %>%
+  filter(!is.na(bp_phase), !(bp_phase == "Postoperative" & is.na(SBP))) %>%
+  inner_join(cohort, by = c("New_MRN", "Surgery_Date")) %>%
+  arrange(New_MRN, bp_phase, meas_dt) %>%
+  group_by(New_MRN, bp_phase) %>%
+  filter(row_number() > 3) %>%
+  ungroup() %>%
+  mutate(PRF_group = factor(if_else(PRF == 1L, "PRF", "No PRF"), levels = c("No PRF", "PRF")))
+
+# Exact 65-mmHg feature for both phases.  The published pipeline contains
+# intraoperative MAP <65 but postoperative thresholds are <50, <60, and <70;
+# this creates a descriptive postoperative MAP <65 measure for comparison.
+patient_features <- bp %>%
+  group_by(New_MRN, PRF, PRF_group, bp_phase) %>%
+  summarise(
+    n_measurements = sum(!is.na(mean_bp)),
+    pct_map_below_65 = mean(mean_bp < 65, na.rm = TRUE),
+    any_map_below_65 = any(mean_bp < 65, na.rm = TRUE),
+    map_mean = mean(mean_bp, na.rm = TRUE),
+    map_sd = sd(mean_bp, na.rm = TRUE),
+    map_iqr = IQR(mean_bp, na.rm = TRUE),
+    map_arv = if (sum(!is.na(mean_bp)) > 1) mean(abs(diff(mean_bp[!is.na(mean_bp)]))) else NA_real_,
+    .groups = "drop"
+  )
+
+summarise_by_outcome <- function(dat, variable) {
+  dat %>%
+    group_by(bp_phase, PRF_group) %>%
+    summarise(
+      n_patients = sum(!is.na(.data[[variable]])),
+      median = median(.data[[variable]], na.rm = TRUE),
+      q1 = quantile(.data[[variable]], .25, na.rm = TRUE),
+      q3 = quantile(.data[[variable]], .75, na.rm = TRUE),
+      mean = mean(.data[[variable]], na.rm = TRUE),
+      sd = sd(.data[[variable]], na.rm = TRUE),
+      .groups = "drop"
+    ) %>% mutate(metric = variable)
+}
+
+metrics <- c("pct_map_below_65", "map_sd", "map_iqr", "map_arv", "map_mean", "n_measurements")
+summary_table <- bind_rows(lapply(metrics, function(x) summarise_by_outcome(patient_features, x)))
+
+tests <- bind_rows(lapply(metrics, function(x) {
+  patient_features %>%
+    group_by(bp_phase) %>%
+    summarise(
+      metric = x,
+      p_value = tryCatch(wilcox.test(.data[[x]] ~ PRF)$p.value, error = function(e) NA_real_),
+      .groups = "drop"
+    )
+}))
+
+any_below <- patient_features %>%
+  group_by(bp_phase, PRF_group) %>%
+  summarise(
+    n_patients = n(),
+    n_any_below_65 = sum(any_map_below_65, na.rm = TRUE),
+    pct_any_below_65 = mean(any_map_below_65, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+write_csv(summary_table, file.path(OUT_DIR, "patient_level_bp_summary.csv"))
+write_csv(tests, file.path(OUT_DIR, "unadjusted_wilcoxon_tests.csv"))
+write_csv(any_below, file.path(OUT_DIR, "any_map_below_65.csv"))
+
+# Distribution of patient-level exposure and variability, by phase and PRF.
+plot_box <- function(variable, label, filename, scale_pct = FALSE) {
+  p <- ggplot(patient_features, aes(x = PRF_group, y = .data[[variable]], fill = PRF_group)) +
+    geom_boxplot(width = .58, outlier.alpha = .22) +
+    geom_jitter(width = .10, alpha = .12, size = .7) +
+    facet_wrap(~bp_phase, scales = "free_y") +
+    scale_fill_manual(values = c("No PRF" = "#6BAED6", "PRF" = "#CB181D")) +
+    labs(x = NULL, y = label, title = paste(label, "by PRF status")) +
+    theme_classic(base_size = 12) + theme(legend.position = "none")
+  if (scale_pct) p <- p + scale_y_continuous(labels = scales::label_percent(accuracy = 1))
+  ggsave(file.path(OUT_DIR, filename), p, width = 8.2, height = 5.2, dpi = 300)
+}
+plot_box("pct_map_below_65", "Patient-level percentage of MAP readings <65 mmHg", "map_below_65_by_prf.png", TRUE)
+plot_box("map_sd", "Within-patient MAP standard deviation (mmHg)", "map_sd_by_prf.png")
+plot_box("map_iqr", "Within-patient MAP IQR (mmHg)", "map_iqr_by_prf.png")
+plot_box("map_arv", "Within-patient MAP average real variability (mmHg)", "map_arv_by_prf.png")
+plot_box("map_mean", "Patient-level mean MAP (mmHg)", "map_mean_by_prf.png")
+
+map_mean_summary <- summary_table %>%
+  filter(metric == "map_mean")
+map_mean_tests <- tests %>%
+  filter(metric == "map_mean")
+write_csv(map_mean_summary, file.path(OUT_DIR, "patient_level_map_mean_summary.csv"))
+write_csv(map_mean_tests, file.path(OUT_DIR, "patient_level_map_mean_wilcoxon_tests.csv"))
+
+# Postoperative trajectory: six-hour intervals measured from surgery start.
+# This avoids mislabeling hours_from_start as time after OR exit.
+postop_bins <- bp %>%
+  filter(bp_phase == "Postoperative", hours_from_start >= 0, hours_from_start < 48) %>%
+  mutate(
+    time_bin = cut(hours_from_start, breaks = seq(0, 48, by = 6), include.lowest = TRUE, right = FALSE,
+                   labels = paste0(seq(0, 42, by = 6), "-", seq(6, 48, by = 6), " h"))
+  )
+
+p_time <- ggplot(postop_bins, aes(x = time_bin, y = mean_bp, fill = PRF_group)) +
+  geom_boxplot(outlier.alpha = .08, position = position_dodge(width = .76), width = .66) +
+  geom_hline(yintercept = 65, linetype = "dashed", colour = "#CB181D") +
+  scale_fill_manual(values = c("No PRF" = "#6BAED6", "PRF" = "#CB181D")) +
+  labs(x = "Time from surgery start", y = "Postoperative MAP (mmHg)", fill = NULL,
+       title = "Postoperative MAP by 6-hour interval and PRF status",
+       subtitle = "Dashed line: MAP 65 mmHg; each observation is a BP measurement") +
+  theme_classic(base_size = 12) + theme(axis.text.x = element_text(angle = 35, hjust = 1))
+ggsave(file.path(OUT_DIR, "postop_map_6h_boxplots_by_prf.png"), p_time, width = 10.2, height = 5.8, dpi = 300)
+
+# Patient-level postoperative MAP ARV within each six-hour interval. Each
+# patient contributes at most one ARV value to a given interval; ARV requires
+# at least two temporally ordered MAP measurements in that interval.
+postop_patient_bin <- postop_bins %>%
+  filter(!is.na(mean_bp)) %>%
+  arrange(New_MRN, Surgery_Date, time_bin, meas_dt) %>%
+  group_by(New_MRN, Surgery_Date, PRF, PRF_group, time_bin) %>%
+  summarise(
+    n_measurements = n(),
+    map_mean = mean(mean_bp),
+    map_arv = if (n() > 1L) mean(abs(diff(mean_bp))) else NA_real_,
+    .groups = "drop"
+  )
+
+postop_patient_bin_arv_summary <- postop_patient_bin %>%
+  filter(!is.na(map_arv)) %>%
+  group_by(time_bin, PRF_group) %>%
+  summarise(
+    n_patients = n(),
+    median_arv = median(map_arv),
+    q1_arv = quantile(map_arv, 0.25),
+    q3_arv = quantile(map_arv, 0.75),
+    .groups = "drop"
+  )
+write_csv(postop_patient_bin, file.path(OUT_DIR, "postop_patient_bin_map_arv.csv"))
+write_csv(postop_patient_bin_arv_summary,
+          file.path(OUT_DIR, "postop_patient_bin_map_arv_summary.csv"))
+
+p_time_arv <- ggplot(
+  filter(postop_patient_bin, !is.na(map_arv)),
+  aes(x = time_bin, y = map_arv, fill = PRF_group)
+) +
+  geom_boxplot(outlier.alpha = 0.08, position = position_dodge(width = .76), width = .66) +
+  geom_point(
+    aes(colour = PRF_group),
+    position = position_jitterdodge(jitter.width = .10, dodge.width = .76),
+    alpha = .12, size = 1, show.legend = FALSE
+  ) +
+  scale_fill_manual(values = c("No PRF" = "#6BAED6", "PRF" = "#CB181D")) +
+  scale_colour_manual(values = c("No PRF" = "#6BAED6", "PRF" = "#CB181D")) +
+  labs(
+    x = "Time from surgery start",
+    y = "Within-patient postoperative MAP ARV (mmHg)",
+    fill = NULL,
+    title = "Postoperative MAP ARV by 6-hour interval and PRF status",
+    subtitle = "Each observation is one patient's ARV within an interval (>=2 MAP measurements)"
+  ) +
+  theme_classic(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+ggsave(file.path(OUT_DIR, "postop_map_arv_6h_boxplots_by_prf.png"), p_time_arv,
+       width = 10.2, height = 5.8, dpi = 300)
+ggsave(file.path(OUT_DIR, "postop_map_arv_6h_boxplots_by_prf.pdf"), p_time_arv,
+       width = 10.2, height = 5.8)
+
+# Adjacent-interval comparisons within each PRF-status group. These comparisons
+# use the individual BP observations displayed in the boxplots. They are
+# exploratory and unpaired: repeated observations from the same patient are not
+# modeled here, so results should not be interpreted as patient-level
+# longitudinal inference. Shapiro-Wilk tests are limited by R to n <= 5,000;
+# when an interval contains more observations, a reproducible random sample of
+# 5,000 is used solely for its normality assessment. The inferential test is
+# then run on all nonmissing observations in the two adjacent intervals.
+safe_shapiro <- function(x, seed) {
+  x <- x[is.finite(x)]
+  if (length(x) < 3L || length(unique(x)) < 3L) {
+    return(list(p_value = NA_real_, n_tested = length(x), sampled = FALSE))
+  }
+  sampled <- length(x) > 5000L
+  if (sampled) {
+    set.seed(seed)
+    x <- sample(x, 5000L)
+  }
+  list(
+    p_value = tryCatch(shapiro.test(x)$p.value, error = function(e) NA_real_),
+    n_tested = length(x),
+    sampled = sampled
+  )
+}
+
+time_levels <- levels(postop_bins$time_bin)
+adjacent_pairs <- tibble(
+  interval_1 = time_levels[-length(time_levels)],
+  interval_2 = time_levels[-1L],
+  comparison_order = seq_len(length(time_levels) - 1L)
+)
+
+adjacent_tests <- bind_rows(lapply(levels(postop_bins$PRF_group), function(group_name) {
+  bind_rows(lapply(seq_len(nrow(adjacent_pairs)), function(i) {
+    interval_1 <- adjacent_pairs$interval_1[i]
+    interval_2 <- adjacent_pairs$interval_2[i]
+    values_1 <- postop_bins %>%
+      filter(PRF_group == group_name, time_bin == interval_1) %>%
+      pull(mean_bp) %>%
+      stats::na.omit()
+    values_2 <- postop_bins %>%
+      filter(PRF_group == group_name, time_bin == interval_2) %>%
+      pull(mean_bp) %>%
+      stats::na.omit()
+
+    normality_1 <- safe_shapiro(values_1, seed = 1000L + i)
+    normality_2 <- safe_shapiro(values_2, seed = 2000L + i)
+    use_wilcoxon <- is.na(normality_1$p_value) || is.na(normality_2$p_value) ||
+      normality_1$p_value < 0.05 || normality_2$p_value < 0.05
+    test_result <- if (use_wilcoxon) {
+      tryCatch(wilcox.test(values_1, values_2, exact = FALSE), error = function(e) NULL)
+    } else {
+      tryCatch(t.test(values_1, values_2), error = function(e) NULL)
+    }
+
+    tibble(
+      PRF_group = group_name,
+      comparison_order = adjacent_pairs$comparison_order[i],
+      interval_1 = interval_1,
+      interval_2 = interval_2,
+      n_interval_1 = length(values_1),
+      n_interval_2 = length(values_2),
+      median_interval_1 = median(values_1),
+      median_interval_2 = median(values_2),
+      median_difference_interval_2_minus_1 = median(values_2) - median(values_1),
+      shapiro_p_interval_1 = normality_1$p_value,
+      shapiro_p_interval_2 = normality_2$p_value,
+      shapiro_n_interval_1 = normality_1$n_tested,
+      shapiro_n_interval_2 = normality_2$n_tested,
+      shapiro_sampled_interval_1 = normality_1$sampled,
+      shapiro_sampled_interval_2 = normality_2$sampled,
+      test_used = if_else(use_wilcoxon, "Wilcoxon rank-sum", "Welch two-sample t-test"),
+      test_statistic = if (is.null(test_result)) NA_real_ else unname(test_result$statistic),
+      p_value = if (is.null(test_result)) NA_real_ else test_result$p.value
+    )
+  }))
+})) %>%
+  group_by(PRF_group) %>%
+  mutate(
+    p_value_holm = p.adjust(p_value, method = "holm"),
+    p_value_bonferroni = p.adjust(p_value, method = "bonferroni")
+  ) %>%
+  ungroup()
+
+write_csv(adjacent_tests, file.path(OUT_DIR, "postop_map_adjacent_6h_interval_tests.csv"))
+
+# Same-interval PRF versus non-PRF comparisons. As with the adjacent-interval
+# analyses, these use individual BP observations and are exploratory and
+# unpaired; repeated measurements from the same patient are not modeled.
+same_interval_tests <- bind_rows(lapply(seq_along(time_levels), function(i) {
+  interval_name <- time_levels[i]
+  values_no_prf <- postop_bins %>%
+    filter(PRF_group == "No PRF", time_bin == interval_name) %>%
+    pull(mean_bp) %>%
+    stats::na.omit()
+  values_prf <- postop_bins %>%
+    filter(PRF_group == "PRF", time_bin == interval_name) %>%
+    pull(mean_bp) %>%
+    stats::na.omit()
+
+  normality_no_prf <- safe_shapiro(values_no_prf, seed = 3000L + i)
+  normality_prf <- safe_shapiro(values_prf, seed = 4000L + i)
+  use_wilcoxon <- is.na(normality_no_prf$p_value) || is.na(normality_prf$p_value) ||
+    normality_no_prf$p_value < 0.05 || normality_prf$p_value < 0.05
+  test_result <- if (use_wilcoxon) {
+    tryCatch(wilcox.test(values_prf, values_no_prf, exact = FALSE), error = function(e) NULL)
+  } else {
+    tryCatch(t.test(values_prf, values_no_prf), error = function(e) NULL)
+  }
+
+  tibble(
+    comparison_order = i,
+    time_interval = interval_name,
+    n_no_prf = length(values_no_prf),
+    n_prf = length(values_prf),
+    median_no_prf = median(values_no_prf),
+    median_prf = median(values_prf),
+    median_difference_prf_minus_no_prf = median(values_prf) - median(values_no_prf),
+    shapiro_p_no_prf = normality_no_prf$p_value,
+    shapiro_p_prf = normality_prf$p_value,
+    shapiro_n_no_prf = normality_no_prf$n_tested,
+    shapiro_n_prf = normality_prf$n_tested,
+    shapiro_sampled_no_prf = normality_no_prf$sampled,
+    shapiro_sampled_prf = normality_prf$sampled,
+    test_used = if_else(use_wilcoxon, "Wilcoxon rank-sum", "Welch two-sample t-test"),
+    test_statistic = if (is.null(test_result)) NA_real_ else unname(test_result$statistic),
+    p_value = if (is.null(test_result)) NA_real_ else test_result$p.value
+  )
+})) %>%
+  mutate(
+    p_value_holm = p.adjust(p_value, method = "holm"),
+    p_value_bonferroni = p.adjust(p_value, method = "bonferroni")
+  )
+
+write_csv(same_interval_tests, file.path(OUT_DIR, "postop_map_prf_vs_no_prf_6h_interval_tests.csv"))
+
+# Distribution overlay for a reproducible visual check of measurement-level shape.
+p_density <- ggplot(postop_bins, aes(x = mean_bp, colour = PRF_group, fill = PRF_group)) +
+  geom_density(alpha = .18, linewidth = .8, na.rm = TRUE) +
+  geom_vline(xintercept = 65, linetype = "dashed", colour = "#CB181D") +
+  scale_colour_manual(values = c("No PRF" = "#2171B5", "PRF" = "#CB181D")) +
+  scale_fill_manual(values = c("No PRF" = "#2171B5", "PRF" = "#CB181D")) +
+  labs(x = "Postoperative MAP (mmHg)", y = "Density", colour = NULL, fill = NULL,
+       title = "Distribution of postoperative MAP measurements by PRF status") +
+  theme_classic(base_size = 12)
+ggsave(file.path(OUT_DIR, "postop_map_distribution_by_prf.png"), p_density, width = 8.2, height = 5.2, dpi = 300)
+
+message("Completed exploratory analysis in: ", OUT_DIR)
