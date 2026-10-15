@@ -1,0 +1,389 @@
+# plot_feature_importance_by_model.R
+
+#0. Setup
+
+required_pkgs <- c("ggplot2", "dplyr", "scales", "forcats")
+missing_pkgs <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly = TRUE)]
+if (length(missing_pkgs) > 0) {
+  install.packages(missing_pkgs, repos = "https://cloud.r-project.org")
+}
+
+library(ggplot2)
+library(dplyr)
+library(scales)
+library(forcats)
+MASTER_DIRS <- list(
+  Preoperative   = "/Users/mohamedseifeldin/Desktop/Projects/Renal Failure project/V7_Cutoff_Results/PRF_Preop/BL_Results_V7_PRF_Preop/PRF",
+  Intraoperative = "/Users/mohamedseifeldin/Desktop/Projects/Renal Failure project/V7_Cutoff_Results/PRF_Intraop/BL_Results_V7_PRF_Intraop/PRF",
+  Postoperative  = "/Users/mohamedseifeldin/Desktop/Projects/Renal Failure project/V7_Cutoff_Results/PRF_Postop/BL_Results_V7_PRF_Postop/PRF",
+  "Preoperative + Postoperative"                  = "/Users/mohamedseifeldin/Desktop/Projects/Renal Failure project/V7_Cutoff_Results/PRF_Preop_Postop/BL_Results_V7_PRF_Preop_Postop/PRF",
+  "Preoperative + Intraoperative"                 = "/Users/mohamedseifeldin/Desktop/Projects/Renal Failure project/V7_Cutoff_Results/PRF_Preop_Intraop/BL_Results_V7_PRF_Preop_Intraop/PRF",
+  "Intraoperative + Postoperative"                = "/Users/mohamedseifeldin/Desktop/Projects/Renal Failure project/V7_Cutoff_Results/PRF_Intraop_Postop/BL_Results_V7_PRF_Intraop_Postop/PRF",
+  "Preoperative + Intraoperative + Postoperative" = "/Users/mohamedseifeldin/Desktop/Projects/Renal Failure project/V7_Cutoff_Results/PRF_Preop_Intraop_Postop/BL_Results_V7_PRF_Preop_Intraop_Postop/PRF",
+  "Preop + Intraop + MAPonly"                     = "/Users/mohamedseifeldin/Desktop/Projects/Renal Failure project/V7_Cutoff_Results/PRF_Preop_Intraop_MAPonly/BL_Results_V7_PRF_Preop_Intraop_MAPonly/PRF"
+)
+CSV_NAMES <- list(
+  Preoperative                                     = "Features_2026-09-22.csv",
+  Intraoperative                                   = "Features_2026-09-21.csv",
+  Postoperative                                     = "Features_2026-09-22.csv",
+  "Preoperative + Postoperative"                    = "Features_2026-09-24.csv",
+  "Preoperative + Intraoperative"                   = "Features_2026-09-23.csv",
+  "Intraoperative + Postoperative"                  = "Features_2026-09-22.csv",
+  "Preoperative + Intraoperative + Postoperative"   = "Features_2026-09-23.csv",
+  "Preop + Intraop + MAPonly"                       = "Features_2026-09-23.csv"
+)
+
+# K values used for the base-learner models in the earlier analysis
+K_MIN <- 2
+K_MAX <- 20
+OUR_BEST_MODEL <- list(
+  Preoperative   = list(model = "rf",          k = 18, test_auc = 0.7629, test_prauc = 0.2176, test_f1 = 0.3250),
+  Intraoperative = list(model = "glmboost",     k = 6,  test_auc = 0.7153, test_prauc = 0.1958, test_f1 = 0.2821),
+  Postoperative  = list(model = "rf",           k = 8,  test_auc = 0.6669, test_prauc = 0.1360, test_f1 = 0.2241),
+  "Preoperative + Postoperative"                  = list(model = "glm",         k = 7,  test_auc = 0.7713, test_prauc = 0.1898, test_f1 = 0.2967),
+  "Preoperative + Intraoperative"                 = list(model = "rf",          k = 11, test_auc = 0.7764, test_prauc = 0.2088, test_f1 = 0.3034),
+  "Intraoperative + Postoperative"                = list(model = "naive_bayes", k = 2,  test_auc = 0.7969, test_prauc = 0.2708, test_f1 = 0.3364),
+  "Preoperative + Intraoperative + Postoperative" = list(model = "naive_bayes", k = 3,  test_auc = 0.7839, test_prauc = 0.3058, test_f1 = 0.4000),
+  "Preop + Intraop + MAPonly" = list(model = "rf", k = 12, test_auc = 0.7307, test_prauc = 0.1684, test_f1 = 0.2872)
+)
+
+#1. Helper
+
+discover_models <- function(master_dir, csv_name) {
+  if (!dir.exists(master_dir)) {
+    warning(sprintf("MASTER_DIR does not exist, skipping: %s", master_dir))
+    return(data.frame(model = character(0), csv_path = character(0)))
+  }
+  
+  model_dirs <- list.dirs(master_dir, recursive = FALSE, full.names = TRUE)
+  model_csvs <- file.path(model_dirs, csv_name)
+  found <- file.exists(model_csvs)
+  
+  data.frame(
+    model = basename(model_dirs)[found],
+    csv_path = model_csvs[found],
+    stringsAsFactors = FALSE
+  )
+}
+
+#Shared theme
+
+theme_report <- function(base_size = 11) {
+  theme_minimal(base_size = base_size) +
+    theme(
+      plot.title = element_text(face = "bold", size = base_size + 3),
+      plot.subtitle = element_text(color = "grey35", size = base_size),
+      axis.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_line(color = "grey90"),
+      panel.background = element_rect(fill = "white", color = NA),
+      plot.background  = element_rect(fill = "white", color = NA),
+      legend.background = element_rect(fill = "white", color = NA),
+      plot.margin = margin(12, 16, 12, 12)
+    )
+}
+
+#2. Function: build all 4 figures for ONE model
+
+make_figures_for_model <- function(model_name, csv_path, stage, output_dir) {
+  stage_tag <- gsub(" \\+ ", "_", stage)
+  stage_tag <- gsub("[^A-Za-z0-9_]", "", stage_tag)
+  
+  tag <- sprintf("%s_%s", stage_tag, model_name)  # e.g. Intraoperative_rf, Preoperative_Intraoperative_rf
+  cat(sprintf("Processing: %s\n", tag))
+  
+  raw <- tryCatch(
+    read.csv(csv_path, row.names = 1, stringsAsFactors = FALSE),
+    error = function(e) {
+      warning(sprintf("Skipping '%s' — could not read CSV: %s", model_name, e$message))
+      return(NULL)
+    }
+  )
+  if (is.null(raw)) return(invisible(NULL))
+  
+  features <- raw %>%
+    rename(importance = numeric_val, feature = feature_names) %>%
+    arrange(desc(importance)) %>%
+    mutate(
+      rank = row_number(),
+      used_in_model = rank <= K_MAX
+    )
+  
+  n_features <- nrow(features)
+  
+  # ---- Figure 1: Top 20 features ----
+  top_n <- min(20, n_features)
+  top20 <- features %>% slice_head(n = top_n)
+
+  optimum <- OUR_BEST_MODEL[[stage]]
+  is_optimum_model <- !is.null(optimum) && identical(optimum$model, model_name)
+  k_used <- if (is_optimum_model) optimum$k else top_n
+  top20 <- top20 %>% mutate(is_used = rank <= k_used)
+
+  legend_label_used <- sprintf("Used by optimum model (top %d)", k_used)
+  legend_label_unused <- "Not used by optimum model"
+
+  fig1 <- ggplot(top20, aes(x = importance, y = fct_reorder(feature, importance), fill = is_used)) +
+    geom_col(width = 0.72) +
+    geom_text(aes(label = sprintf("%.3f", importance), color = is_used),
+              hjust = -0.15, size = 4.2, fontface = "bold") +
+    scale_fill_manual(values = c(`TRUE` = "#1E2761", `FALSE` = "#B8BFCC"),
+                       labels = c(`TRUE` = legend_label_used, `FALSE` = legend_label_unused),
+                       name = NULL) +
+    scale_color_manual(values = c(`TRUE` = "#111111", `FALSE` = "#6B7280"), guide = "none") +
+    scale_x_continuous(limits = c(0, max(top20$importance) * 1.12),
+                       expand = expansion(mult = c(0, 0.02))) +
+    labs(
+      title = sprintf("%s, %s: Feature Importance (varImp)", stage, model_name),
+      x = "Importance Score", y = NULL
+    ) +
+    theme_report(base_size = 13) +
+    theme(
+      axis.text.y = element_text(size = 15, face = "bold", color = "#111111"),
+      axis.text.x = element_text(size = 11),
+      legend.position = "bottom",
+      legend.text = element_text(size = 12)
+    )
+
+  ggsave(file.path(output_dir, sprintf("%s_fig1_top20_importance.png", tag)), fig1,
+         width = 11, height = 8.6, dpi = 300, bg = "white")
+
+  
+  # ---- Figure 2: Full ranked dot plot with K cutoff band ----
+  fig2 <- ggplot(features, aes(x = rank, y = importance)) +
+    annotate("rect", xmin = K_MIN - 0.5, xmax = K_MAX + 0.5, ymin = -Inf, ymax = Inf,
+             fill = "#B7E1CD", alpha = 0.4) +
+    geom_line(color = "grey60", linewidth = 0.4) +
+    geom_point(aes(color = used_in_model), size = 2) +
+    geom_vline(xintercept = c(K_MIN, K_MAX), linetype = "dashed", color = "#1B3A6B", linewidth = 0.4) +
+    annotate("text", x = (K_MIN + K_MAX) / 2, y = max(features$importance) * 0.98,
+             label = sprintf("K = %d..%d feature range\nused in base-learner models", K_MIN, K_MAX),
+             size = 3.2, color = "#1B3A6B", fontface = "italic") +
+    scale_color_manual(values = c(`TRUE` = "#1B3A6B", `FALSE` = "grey70"), guide = "none") +
+    scale_x_continuous(breaks = pretty_breaks(10)) +
+    labs(
+      title = sprintf("All Features Ranked by Importance \u2014 %s", stage),
+      subtitle = sprintf("%d features total; shaded band = features selectable within K = %d-%d",
+                         n_features, K_MIN, K_MAX),
+      x = "Feature Rank", y = "Importance Score"
+    ) +
+    theme_report()
+  
+  ggsave(file.path(output_dir, sprintf("%s_fig2_full_ranked_dotplot.png", tag)), fig2,
+         width = 9, height = 6, dpi = 300, bg = "white")
+  
+  # ---- Figure 3: Distribution of importance scores ----
+  fig3 <- ggplot(features, aes(x = importance)) +
+    geom_histogram(bins = 20, fill = "#1B3A6B", color = "white", alpha = 0.85) +
+    geom_vline(xintercept = median(features$importance), linetype = "dashed", color = "#D9534F") +
+    annotate("text", x = median(features$importance), y = Inf,
+             label = sprintf("median = %.3f", median(features$importance)),
+             vjust = 1.5, hjust = -0.05, size = 3.2, color = "#D9534F") +
+    labs(
+      title = sprintf("Distribution of Feature Importance Scores \u2014 %s", stage),
+      subtitle = sprintf("n = %d features", n_features),
+      x = "Importance Score", y = "Number of Features"
+    ) +
+    theme_report()
+  
+  ggsave(file.path(output_dir, sprintf("%s_fig3_score_distribution.png", tag)), fig3,
+         width = 8, height = 5.5, dpi = 300, bg = "white")
+  
+  #Figure 4: Cumulative share of total importance
+  features <- features %>%
+    mutate(
+      cum_importance = cumsum(importance),
+      cum_share = cum_importance / sum(importance)
+    )
+  
+  k_labels <- features %>% filter(rank %in% c(K_MIN, min(K_MAX, n_features)))
+  
+  fig4 <- ggplot(features, aes(x = rank, y = cum_share)) +
+    geom_line(color = "#1B3A6B", linewidth = 0.9) +
+    geom_point(data = k_labels, color = "#D9534F", size = 2.5) +
+    geom_text(data = k_labels, aes(label = sprintf("K=%d\n%.0f%%", rank, cum_share * 100)),
+              vjust = -0.6, size = 3.2, color = "#D9534F") +
+    scale_y_continuous(labels = percent_format(accuracy = 1)) +
+    scale_x_continuous(breaks = pretty_breaks(10)) +
+    labs(
+      title = sprintf("Cumulative Share of Total Importance \u2014 %s", stage),
+      subtitle = "As additional ranked features are added",
+      x = "Number of Top Features Included (K)", y = "Cumulative Share of Total Importance"
+    ) +
+    theme_report()
+  
+  ggsave(file.path(output_dir, sprintf("%s_fig4_cumulative_score.png", tag)), fig4,
+         width = 8.5, height = 5.5, dpi = 300, bg = "white")
+  
+  cat(sprintf("  -> 4 figures written for %s\n", model_name))
+  invisible(NULL)
+}
+
+#3. Loop over every stage, then every model within it
+
+total_processed <- 0
+
+for (stage in names(MASTER_DIRS)) {
+  
+  master_dir <- MASTER_DIRS[[stage]]
+  cat(sprintf("\n=== Stage: %s ===\n", stage))
+  cat(sprintf("MASTER_DIR: %s\n", master_dir))
+  
+  csv_name <- CSV_NAMES[[stage]]
+  cat(sprintf("Looking for: %s\n", csv_name))
+  
+  models_df <- discover_models(master_dir, csv_name)
+  
+  if (nrow(models_df) == 0) {
+    cat(sprintf("  No '%s' files found under any subfolder \u2014 skipping this stage.\n", csv_name))
+    next
+  }
+    output_dir <- file.path(master_dir, "figures")
+  dir.create(output_dir, showWarnings = FALSE)
+  
+  cat(sprintf("  Found %d model folders. Figures will be saved to:\n  %s\n",
+              nrow(models_df), output_dir))
+  
+  for (i in seq_len(nrow(models_df))) {
+    make_figures_for_model(models_df$model[i], models_df$csv_path[i], stage, output_dir)
+    total_processed <- total_processed + 1
+  }
+}
+
+cat(sprintf("\nDone. %d model x stage combinations processed.\n", total_processed))
+cat("Each stage's figures were saved into a 'figures' subfolder inside that stage's own PRF_train directory,\n")
+cat("with filenames like <Stage>_<Model>_fig1_top20_importance.png.\n")
+
+# 4. COMPARISON TABLE: our top model per stage vs. Saif Khan's prior thesis
+
+SAIF_RESULTS <- list(
+  Preoperative = list(
+    model = "LR (SMOTE-NC)", k = 5,
+    test_auc = 0.822, test_prauc = 0.218, test_f1 = 0.304,
+    features = c("Race: White", "Race: Black/African American",
+                 "Last Creatinine Level", "Hemoglobin", "Age")
+  ),
+  Intraoperative = list(
+    model = "None \u2014 no candidate model met the \u22650.70 train/test AUROC threshold",
+    k = NA_real_, test_auc = NA_real_, test_prauc = NA_real_, test_f1 = NA_real_, features = character(0)
+  ),
+  Postoperative = list(
+    model = "RF (SMOTE-NC)", k = 14,
+    test_auc = 0.712, test_prauc = 0.215, test_f1 = 0.235,
+    features = c("SBP % spikes of 40+ mmHg", "SBP minimum rate", "MAP Q3",
+                 "MAP minimum rate", "MAP max", "MAP Q1",
+                 "MAP average real variability")
+  )
+)
+
+
+COMPARISON_DIR <- file.path(dirname(dirname(MASTER_DIRS[["Preoperative"]])), "Comparison_vs_Saif")
+dir.create(COMPARISON_DIR, showWarnings = FALSE, recursive = TRUE)
+
+get_our_top_features <- function(stage, model, k) {
+  master_dir <- MASTER_DIRS[[stage]]
+  csv_path <- file.path(master_dir, model, CSV_NAMES[[stage]])
+  if (!file.exists(csv_path)) {
+    warning(sprintf("Could not find %s for stage=%s, model=%s \u2014 feature agreement will be blank.",
+                    csv_path, stage, model))
+    return(character(0))
+  }
+  raw <- read.csv(csv_path, row.names = 1, stringsAsFactors = FALSE)
+  ranked <- raw %>%
+    rename(importance = numeric_val, feature = feature_names) %>%
+    arrange(desc(importance))
+  head(ranked$feature, k)
+}
+features_agree <- function(our_features, saif_features) {
+  if (length(saif_features) == 0 || length(our_features) == 0) return(character(0))
+  our_lower  <- tolower(our_features)
+  saif_lower <- tolower(saif_features)
+  keywords <- c("creatinine", "hemoglobin", "race", "age", "map", "sbp",
+                "bilirubin", "albumin", "meld", "inr", "bypass")
+  agreements <- character(0)
+  for (sf in saif_features) {
+    hit_kw <- keywords[sapply(keywords, function(kw) grepl(kw, tolower(sf)))]
+    if (length(hit_kw) == 0) next
+    matched_ours <- our_features[sapply(our_lower, function(of) any(sapply(hit_kw, function(kw) grepl(kw, of))))]
+    if (length(matched_ours) > 0) {
+      agreements <- c(agreements, sprintf("%s \u2194 %s", sf, paste(unique(matched_ours), collapse = "; ")))
+    }
+  }
+  agreements
+}
+
+comparison_rows <- list()
+
+for (stage in names(SAIF_RESULTS)) {
+  
+  saif <- SAIF_RESULTS[[stage]]
+  ours <- OUR_BEST_MODEL[[stage]]
+  
+  our_features <- get_our_top_features(stage, ours$model, ours$k)
+  agreements <- features_agree(our_features, saif$features)
+  
+  fewer_features <- if (!is.na(saif$k)) (ours$k < saif$k) else NA
+  better_auc     <- if (!is.na(saif$test_auc)) (ours$test_auc > saif$test_auc) else NA
+  
+  comparison_rows[[stage]] <- data.frame(
+    Stage = stage,
+    Our_Model = ours$model,
+    Our_k = ours$k,
+    Our_Test_AUC = ours$test_auc,
+    Our_Test_PRAUC = ours$test_prauc,
+    Our_Test_F1 = ours$test_f1,
+    Saif_Model = saif$model,
+    Saif_k = saif$k,
+    Saif_Test_AUC = saif$test_auc,
+    Saif_Test_PRAUC = saif$test_prauc,
+    Saif_Test_F1 = saif$test_f1,
+    Better_AUC_Than_Saif = better_auc,
+    Fewer_Features_Than_Saif = fewer_features,
+    Our_Top_Features = paste(our_features, collapse = "; "),
+    Saif_Features = paste(saif$features, collapse = "; "),
+    Feature_Agreement = paste(agreements, collapse = " | "),
+    stringsAsFactors = FALSE
+  )
+}
+
+comparison_df <- do.call(rbind, comparison_rows)
+rownames(comparison_df) <- NULL
+
+comparison_csv_path <- file.path(COMPARISON_DIR, "comparison_vs_Saif.csv")
+write.csv(comparison_df, comparison_csv_path, row.names = FALSE)
+cat(sprintf("\nComparison table (our results vs. Saif Khan's thesis) written to:\n  %s\n", comparison_csv_path))
+
+#Simple visual summary: Test AUC, ours vs. Saif's, per stage
+
+plot_df <- do.call(rbind, lapply(names(SAIF_RESULTS), function(stage) {
+  rbind(
+    data.frame(Stage = stage, Source = "Ours (base learners)",
+               Test_AUC = as.numeric(OUR_BEST_MODEL[[stage]]$test_auc)),
+    data.frame(Stage = stage, Source = "Saif Khan (thesis)",
+               Test_AUC = as.numeric(SAIF_RESULTS[[stage]]$test_auc))
+  )
+}))
+plot_df$Stage <- factor(plot_df$Stage, levels = c("Preoperative", "Intraoperative", "Postoperative"))
+
+fig_compare <- ggplot(plot_df, aes(x = Stage, y = Test_AUC, fill = Source)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.6, na.rm = TRUE) +
+  geom_text(aes(label = ifelse(is.na(Test_AUC), "N/A", sprintf("%.3f", Test_AUC))),
+            position = position_dodge(width = 0.7), vjust = -0.4, size = 3.3, na.rm = TRUE) +
+  scale_fill_manual(values = c("Ours (base learners)" = "#1B3A6B", "Saif Khan (thesis)" = "#D9534F")) +
+  scale_y_continuous(limits = c(0, 1), labels = percent_format(accuracy = 1)) +
+  labs(
+    title = "Best Model Test AUC by Stage: This Analysis vs. Saif Khan's Thesis",
+    subtitle = "Intraoperative: Saif reported no candidate model met the \u2265 0.70 AUROC threshold",
+    x = NULL, y = "Test AUC", fill = NULL
+  ) +
+  theme_report()
+
+ggsave(file.path(COMPARISON_DIR, "comparison_test_auc_vs_Saif.png"), fig_compare,
+       width = 8.5, height = 5.5, dpi = 300, bg = "white")
+
+cat(sprintf("Comparison figure written to:\n  %s\n",
+            file.path(COMPARISON_DIR, "comparison_test_auc_vs_Saif.png")))
+cat("\nSummary:\n")
+print(comparison_df[, c("Stage", "Our_Model", "Our_k", "Our_Test_AUC",
+                        "Saif_Model", "Saif_k", "Saif_Test_AUC",
+                        "Better_AUC_Than_Saif", "Fewer_Features_Than_Saif")])
