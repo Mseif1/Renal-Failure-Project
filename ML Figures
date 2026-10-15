@@ -1,0 +1,647 @@
+# PRF ML BASE LEARNER PERFORMANCE FIGURES
+
+# Required packages
+required_pkgs <- c("ggplot2","dplyr","tidyr","patchwork","readxl","scales")
+invisible(lapply(required_pkgs, function(p) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+  library(p, character.only = TRUE)
+}))
+
+setwd("~/Desktop/Projects/Renal Failure project")
+
+# =============================================================================
+# 0. LOAD DATA
+# =============================================================================
+
+# -- Individual-timepoint datasets ---------------------------------------
+df_pre   <- read_excel("Base_Learners_Performance_DF_Preop.xlsx",
+                        sheet = "Base Learners") %>% mutate(Dataset = "Preoperative")
+df_intra <- read_excel("Base_Learners_Performance_DF_Intraop.xlsx",
+                        sheet = "Base Learners") %>% mutate(Dataset = "Intraoperative")
+df_post  <- read_excel("Base_Learners_Performance_DF_Postop.xlsx",
+                        sheet = "Base Learners") %>% mutate(Dataset = "Postoperative")
+
+# -- Combination datasets -----------------------------------------------------
+df_pre_post       <- read_excel("Base_Learners_Performance_DF_Preop_Postop.xlsx",
+                                 sheet = "Base Learners") %>% mutate(Dataset = "Pre+Post")
+df_pre_intra      <- read_excel("Base_Learners_Performance_DF_Preop_Intraop.xlsx",
+                                 sheet = "Base Learners") %>% mutate(Dataset = "Pre+Intra")
+df_intra_post     <- read_excel("Base_Learners_Performance_DF_Intraop_Postop.xlsx",
+                                 sheet = "Base Learners") %>% mutate(Dataset = "Intra+Post")
+df_pre_intra_post <- read_excel("Base_Learners_Performance_DF_Preop_Intraop_Postop.xlsx",
+                                 sheet = "Base Learners") %>% mutate(Dataset = "Pre+Intra+Post")
+df_pre_intra_MAPonly <- read_excel("Base_Learners_Performance_DF_Preop_Intraop_MAPonly.xlsx",
+                                    sheet = "Base Learners") %>% mutate(Dataset = "Pre+Intra (MAP only)")
+
+# -- Add AUC gap for all datasets ---------------------------------------------
+for (nm in c("df_pre","df_intra","df_post",
+             "df_pre_post","df_pre_intra","df_intra_post","df_pre_intra_post",
+             "df_pre_intra_MAPonly")) {
+  assign(nm, get(nm) %>% mutate(AUC_Gap = Train_AUC - Test_AUC))
+}
+
+
+# 1. SHARED CONSTANTS
+MODEL_COLORS <- c(
+  naive_bayes       = "#1B3A6B",
+  pcaNNet           = "#4CAF50", avNNet            = "#8BC34A",
+  svmRadial         = "#FF9800", svmLinear         = "#795548",
+  glm               = "#E91E63", glmboost          = "#9C27B0",
+  rf                = "#F44336", svmRadialWeights  = "#FF5722",
+  nnet              = "#607D8B", pam               = "#009688",
+  LogitBoost        = "#CDDC39",
+  evtree            = "#9E9E9E"
+)
+OPT_K_PRE <- c(
+  naive_bayes=25, pcaNNet=3,  avNNet=20, svmRadial=24, svmLinear=13,
+  glm=25,         glmboost=23, nnet=14,  pam=22,       rf=23,
+  LogitBoost=16,  evtree=8,   svmRadialWeights=25
+)
+OPT_K_INTRA <- c(
+  naive_bayes=2,  pcaNNet=22, avNNet=2,  svmRadial=7,  svmLinear=2,
+  glm=3,          glmboost=6, nnet=11,   pam=2,        rf=6,
+  LogitBoost=11,  evtree=25,  svmRadialWeights=9
+)
+OPT_K_POST <- c(
+  naive_bayes=18, pcaNNet=20, avNNet=13, svmRadial=6,  svmLinear=8,
+  glm=21,         glmboost=14, nnet=9,   pam=8,        rf=8,
+  LogitBoost=3,   evtree=15,  svmRadialWeights=12
+)
+OPT_K_PRE_POST <- c(
+  naive_bayes=2,  pcaNNet=22, avNNet=20, svmRadial=16, svmLinear=22,
+  glm=7,          glmboost=20, nnet=25,  pam=12,       rf=19,
+  LogitBoost=8,   evtree=22,  svmRadialWeights=16
+)
+OPT_K_PRE_INTRA <- c(
+  naive_bayes=11, pcaNNet=2,  avNNet=4,  svmRadial=6,  svmLinear=21,
+  glm=21,         glmboost=22, nnet=23,  pam=3,        rf=11,
+  LogitBoost=3,   evtree=2,   svmRadialWeights=11
+)
+OPT_K_INTRA_POST <- c(
+  naive_bayes=2,  pcaNNet=2,  avNNet=2,  svmRadial=6,  svmLinear=13,
+  glm=24,         glmboost=6, nnet=19,   pam=11,       rf=5,
+  LogitBoost=24,  evtree=2,   svmRadialWeights=5
+)
+OPT_K_PRE_INTRA_POST <- c(
+  naive_bayes=3,  pcaNNet=24, avNNet=25, svmRadial=2,  svmLinear=4,
+  glm=21,         glmboost=23, nnet=24,  pam=6,        rf=5,
+  LogitBoost=14,  evtree=21,  svmRadialWeights=14
+)
+
+GAP_THRESHOLD <- 0.05
+
+#Shared prevalence values
+PRE_PREV       <- 0.0807   # Preoperative PRF prevalence
+INTRA_PREV     <- 0.0977   # Intraoperative PRF prevalence
+POST_PREV      <- 0.0704   # Postoperative PRF prevalence
+PRE_POST_PREV       <- 0.0750
+PRE_INTRA_PREV      <- 0.0900
+INTRA_POST_PREV     <- 0.0840
+PRE_INTRA_POST_PREV <- 0.0830
+
+#Standard model ordering
+ALL_MODELS_ORDER <- c(
+  "naive_bayes","pcaNNet","avNNet","svmRadial","svmLinear",
+  "glm","glmboost","nnet","pam","rf","LogitBoost","evtree","svmRadialWeights"
+)
+
+#Shared theme
+theme_ml <- function(base_size = 10) {
+  theme_classic(base_size = base_size) +
+    theme(
+      text             = element_text(family = "serif"),
+      plot.title       = element_text(face = "bold", size = base_size + 1,
+                                      hjust = 0.5, margin = margin(b = 5)),
+      plot.subtitle    = element_text(size = base_size - 1, hjust = 0.5,
+                                      color = "grey40", margin = margin(b = 4)),
+      axis.title       = element_text(size = base_size),
+      axis.text        = element_text(size = base_size - 1),
+      legend.text      = element_text(size = base_size - 1),
+      legend.title     = element_blank(),
+      legend.key.size  = unit(0.45, "cm"),
+      legend.background = element_rect(fill = alpha("white", 0.85), color = NA),
+      panel.grid.major = element_line(color = "grey90", linewidth = 0.35),
+      panel.grid.minor = element_blank(),
+      strip.text       = element_text(face = "bold", size = base_size),
+      strip.background = element_rect(fill = "grey95", color = NA),
+      plot.margin      = margin(8, 8, 8, 8)
+    )
+}
+
+# 2. HELPER FUNCTIONS
+
+add_ribbon_cols <- function(df) {
+  df %>%
+    mutate(
+      ymin_red  = ifelse(AUC_Gap >  GAP_THRESHOLD, Test_AUC,  NA_real_),
+      ymax_red  = ifelse(AUC_Gap >  GAP_THRESHOLD, Train_AUC, NA_real_),
+      ymin_blue = ifelse(Test_AUC > Train_AUC, Train_AUC, NA_real_),
+      ymax_blue = ifelse(Test_AUC > Train_AUC, Test_AUC,  NA_real_),
+      ymin_ok   = ifelse(AUC_Gap > 0 & AUC_Gap <= GAP_THRESHOLD, Test_AUC,  NA_real_),
+      ymax_ok   = ifelse(AUC_Gap > 0 & AUC_Gap <= GAP_THRESHOLD, Train_AUC, NA_real_)
+    )
+}
+
+geom_opt_diamonds <- function(df, opt_k_vec, metric_col, size = 4.5) {
+  opt_rows <- df %>%
+    rowwise() %>%
+    filter(FeatureNumber == opt_k_vec[ModelName]) %>%
+    ungroup()
+  list(
+    geom_point(data = opt_rows,
+               aes(x = FeatureNumber, y = .data[[metric_col]],
+                   color = ModelName),
+               shape = 18, size = size, stroke = 0.5,
+               show.legend = FALSE)
+  )
+}
+
+geom_opt_vlines <- function(models, opt_k_vec) {
+  vline_df <- data.frame(
+    ModelName = factor(models, levels = models),
+    opt_k     = as.integer(opt_k_vec[models])
+  )
+  geom_vline(data = vline_df,
+             aes(xintercept = opt_k),
+             color = "grey30", linetype = "dotted", linewidth = 0.8)
+}
+
+gap_label_df <- function(df, models, opt_k_vec, include_min = FALSE) {
+  df %>%
+    filter(ModelName %in% models) %>%
+    group_by(ModelName) %>%
+    summarise(
+      max_gap = round(max(AUC_Gap), 3),
+      min_gap = round(min(AUC_Gap), 3),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      label     = if (include_min)
+                    paste0("Max: ", max_gap, "\nMin: ", min_gap)
+                  else
+                    paste0("Max gap: ", max_gap),
+      gap_color = ifelse(max_gap > GAP_THRESHOLD, "#C62828", "#2E7D32"),
+      ModelName = factor(ModelName, levels = models)
+    )
+}
+make_traintestfig <- function(df, sel_models, opt_k_vec,
+                              title, subtitle,
+                              include_blue = FALSE,
+                              y_lo = 0.35, y_hi = 0.98) {
+  dat <- df %>%
+    filter(ModelName %in% sel_models) %>%
+    mutate(ModelName = factor(ModelName, levels = sel_models)) %>%
+    add_ribbon_cols()
+
+  dat_red  <- dat %>% filter(!is.na(ymin_red))
+  dat_ok   <- dat %>% filter(!is.na(ymin_ok))
+  dat_blue <- dat %>% filter(!is.na(ymin_blue))
+
+  gap_labs <- gap_label_df(dat, sel_models, opt_k_vec,
+                           include_min = include_blue)
+
+  p <- ggplot(dat, aes(x = FeatureNumber))
+
+  if (nrow(dat_red)  > 0)
+    p <- p + geom_ribbon(data = dat_red,
+                         aes(ymin = ymin_red, ymax = ymax_red),
+                         fill = "#F44336", alpha = 0.18, color = NA)
+  if (nrow(dat_ok)   > 0)
+    p <- p + geom_ribbon(data = dat_ok,
+                         aes(ymin = ymin_ok, ymax = ymax_ok),
+                         fill = "grey60", alpha = 0.10, color = NA)
+  if (include_blue && nrow(dat_blue) > 0)
+    p <- p + geom_ribbon(data = dat_blue,
+                         aes(ymin = ymin_blue, ymax = ymax_blue),
+                         fill = "#1565C0", alpha = 0.14, color = NA)
+
+  p <- p +
+    geom_line(aes(y = Train_AUC, color = ModelName),
+              linewidth = 1.2, linetype = "solid") +
+    geom_line(aes(y = Test_AUC,  color = ModelName),
+              linewidth = 1.2, linetype = "dashed", alpha = 0.85) +
+    geom_opt_vlines(sel_models, opt_k_vec) +
+    geom_opt_diamonds(dat, opt_k_vec, "Test_AUC", size = 4.5) +
+    geom_text(data = gap_labs,
+              aes(x = 24.5, y = y_lo + 0.03,
+                  label = label, color = gap_color),
+              size = 2.6, hjust = 1, family = "serif",
+              show.legend = FALSE) +
+    scale_color_manual(values = c(MODEL_COLORS,
+                                  "#C62828" = "#C62828",
+                                  "#2E7D32" = "#2E7D32")) +
+    scale_fill_manual(values  = MODEL_COLORS, guide = "none") +
+    scale_x_continuous(breaks = c(2, 5, 10, 15, 20, 25)) +
+    scale_y_continuous(limits = c(y_lo, y_hi),
+                       labels = number_format(accuracy = 0.01)) +
+    facet_wrap(~ModelName, ncol = 3) +
+    labs(title = title, subtitle = subtitle,
+         x = "Number of Features (k)", y = "AUROC") +
+    theme_ml() +
+    theme(legend.position = "none")
+
+  p
+}
+
+make_allmodels_fig <- function(df, all_models, opt_k_vec,
+                               title, include_blue = FALSE) {
+  dat <- df %>%
+    mutate(ModelName = factor(ModelName, levels = all_models)) %>%
+    add_ribbon_cols()
+
+  vline_df <- data.frame(
+    ModelName = factor(all_models, levels = all_models),
+    opt_k     = as.integer(opt_k_vec[all_models])
+  )
+  opt_rows <- dat %>%
+    rowwise() %>%
+    filter(FeatureNumber == opt_k_vec[as.character(ModelName)]) %>%
+    ungroup()
+
+  dat_red  <- dat %>% filter(!is.na(ymin_red))
+  dat_blue <- dat %>% filter(!is.na(ymin_blue))
+
+  p <- ggplot(dat, aes(x = FeatureNumber))
+
+  if (nrow(dat_red)  > 0)
+    p <- p + geom_ribbon(data = dat_red,
+                         aes(ymin = ymin_red, ymax = ymax_red),
+                         fill = "#F44336", alpha = 0.22, color = NA)
+  if (include_blue && nrow(dat_blue) > 0)
+    p <- p + geom_ribbon(data = dat_blue,
+                         aes(ymin = ymin_blue, ymax = ymax_blue),
+                         fill = "#1565C0", alpha = 0.14, color = NA)
+
+  p <- p +
+    geom_line(aes(y = Train_AUC, color = ModelName),
+              linewidth = 0.75, linetype = "solid", alpha = 0.85) +
+    geom_line(aes(y = Test_AUC,  color = ModelName),
+              linewidth = 0.75, linetype = "dashed", alpha = 0.85) +
+    geom_vline(data = vline_df,
+               aes(xintercept = opt_k),
+               color = "grey40", linetype = "dotted", linewidth = 0.6) +
+    geom_point(data = opt_rows,
+               aes(x = FeatureNumber, y = Test_AUC, color = ModelName),
+               shape = 18, size = 2.8, show.legend = FALSE) +
+    scale_color_manual(values = MODEL_COLORS, guide = "none") +
+    scale_x_continuous(breaks = c(2, 5, 10, 15, 20, 25)) +
+    scale_y_continuous(limits = c(0.25, 1.0),
+                       labels = number_format(accuracy = 0.01)) +
+    facet_wrap(~ModelName, ncol = 5) +
+    labs(
+      title    = title,
+      subtitle = paste("Solid = Train  |  Dashed = Test  |",
+                       "Red shading = gap > 0.05",
+                       if (include_blue) "|  Blue shading = test exceeds train" else "",
+                       "|  Diamond = recommended k"),
+      x = "Number of Features (k)",
+      y = "AUROC"
+    ) +
+    theme_ml(base_size = 9) +
+    theme(strip.text = element_text(size = 7.5, face = "bold"))
+
+  p
+}
+make_topmodels_fig <- function(df, top_models, opt_k_vec,
+                               title, subtitle,
+                               y_lo = 0.45, y_hi = 0.90,
+                               ref_line = NULL, ref_label = NULL) {
+  dat <- df %>% filter(ModelName %in% top_models)
+
+  p <- dat %>%
+    ggplot(aes(x = FeatureNumber, y = Test_AUC,
+               color = ModelName, group = ModelName)) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2.2) +
+    geom_opt_diamonds(dat, opt_k_vec, "Test_AUC") +
+    scale_color_manual(values = MODEL_COLORS) +
+    scale_x_continuous(breaks = seq(2, 25, 3)) +
+    scale_y_continuous(limits = c(y_lo, y_hi),
+                       labels = number_format(accuracy = 0.01)) +
+    labs(title = title, subtitle = subtitle,
+         x = "Number of Features (k)", y = "Test Set AUROC") +
+    theme_ml()
+
+  if (!is.null(ref_line)) {
+    p <- p +
+      geom_hline(yintercept = ref_line, linetype = "dotted",
+                 color = "grey30", linewidth = 0.7) +
+      annotate("text", x = 24.5, y = ref_line + 0.006,
+               label = ref_label, size = 2.8, hjust = 1,
+               color = "grey30", family = "serif")
+  }
+  p
+}
+
+# PRAUC line chart
+make_prauc_fig <- function(df, top_models, opt_k_vec, prevalence,
+                           title, dataset_label) {
+  dat <- df %>% filter(ModelName %in% top_models)
+
+  dat %>%
+    ggplot(aes(x = FeatureNumber, y = Test_PRAUC,
+               color = ModelName, group = ModelName)) +
+    geom_hline(yintercept = prevalence, linetype = "dotted",
+               color = "grey30", linewidth = 0.8) +
+    annotate("text", x = 24.5, y = prevalence + 0.006,
+             label = paste0("No-skill (~", scales::percent(prevalence, 0.1), " PRF)"),
+             size = 2.8, hjust = 1, color = "grey30", family = "serif") +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 2.2) +
+    geom_opt_diamonds(dat, opt_k_vec, "Test_PRAUC") +
+    scale_color_manual(values = MODEL_COLORS) +
+    scale_x_continuous(breaks = seq(2, 25, 3)) +
+    labs(title    = paste("Test PRAUC vs Feature Count — Top Models",
+                          paste0("(", dataset_label, ")")),
+         subtitle = "Diamond = recommended k  |  Dotted = no-skill baseline",
+         x = "Number of Features (k)", y = "Test Set PRAUC") +
+    theme_ml()
+}
+
+
+# 3. PREOPERATIVE FIGURES
+
+cat("Building preoperative figures...\n")
+TOP_PRE    <- c("svmLinear","rf","naive_bayes","glm","glmboost","pam")
+TOP_PR_PRE <- c("svmLinear","rf","naive_bayes","glm","glmboost","pam")
+SEL6_PRE   <- c("svmLinear","rf","naive_bayes","glm","glmboost","pam")
+
+pre_fig1 <- make_topmodels_fig(
+  df_pre, TOP_PRE, OPT_K_PRE,
+  title    = "Test AUROC vs Feature Count — Top Models (Preoperative)",
+  subtitle = "Diamond = recommended k",
+  y_lo = 0.45, y_hi = 0.80
+)
+
+pre_fig2 <- make_traintestfig(
+  df_pre, SEL6_PRE, OPT_K_PRE,
+  title    = "Train vs Test AUROC — Selected Models (Preoperative)",
+  subtitle = "Solid = Train  |  Dashed = Test  |  Red shading = gap > 0.05  |  Diamond = recommended k",
+  include_blue = FALSE, y_lo = 0.40, y_hi = 0.95
+)
+
+pre_fig3 <- make_prauc_fig(
+  df_pre, TOP_PR_PRE, OPT_K_PRE, PRE_PREV,
+  title = "Test PRAUC vs Feature Count — Top Models (Preoperative)",
+  dataset_label = "Preoperative"
+)
+
+pre_fig4 <- make_allmodels_fig(
+  df_pre, ALL_MODELS_ORDER, OPT_K_PRE,
+  title        = "All 13 Base Learners: Train vs Test AUROC — Preoperative",
+  include_blue = FALSE
+)
+
+
+# 4. INTRAOPERATIVE FIGURES
+
+cat("Building intraoperative figures...\n")
+TOP_INTRA    <- c("glmboost","glm","svmLinear","avNNet","pcaNNet","naive_bayes")
+TOP_PR_INTRA <- c("glmboost","glm","svmLinear","avNNet","pcaNNet","naive_bayes")
+SEL6_INTRA   <- c("glmboost","glm","svmLinear","avNNet","pcaNNet","naive_bayes")
+
+intra_fig1 <- make_topmodels_fig(
+  df_intra, TOP_INTRA, OPT_K_INTRA,
+  title    = "Test AUROC vs Feature Count — Top Models (Intraoperative)",
+  subtitle = "Diamond = recommended k",
+  y_lo = 0.50, y_hi = 0.78
+)
+
+intra_fig2 <- make_traintestfig(
+  df_intra, SEL6_INTRA, OPT_K_INTRA,
+  title    = "Train vs Test AUROC — Selected Models (Intraoperative)",
+  subtitle = "Solid = Train  |  Dashed = Test  |  Red shading = gap > 0.05  |  Blue shading = test exceeds train  |  Diamond = recommended k",
+  include_blue = TRUE, y_lo = 0.35, y_hi = 0.98
+)
+
+intra_fig3 <- make_prauc_fig(
+  df_intra, TOP_PR_INTRA, OPT_K_INTRA, INTRA_PREV,
+  title = "Test PRAUC vs Feature Count — Top Models (Intraoperative)",
+  dataset_label = "Intraoperative"
+)
+
+intra_fig4 <- make_allmodels_fig(
+  df_intra, ALL_MODELS_ORDER, OPT_K_INTRA,
+  title        = "All 13 Base Learners: Train vs Test AUROC — Intraoperative",
+  include_blue = TRUE
+)
+
+
+# 5. POSTOPERATIVE FIGURES
+cat("Building postoperative figures...\n")
+TOP_POST    <- c("LogitBoost","rf","naive_bayes","glmboost","glm","nnet")
+TOP_PR_POST <- c("LogitBoost","rf","naive_bayes","glmboost","glm","nnet")
+SEL6_POST   <- c("LogitBoost","rf","naive_bayes","glmboost","glm","nnet")
+
+post_fig1 <- make_topmodels_fig(
+  df_post, TOP_POST, OPT_K_POST,
+  title    = "Test AUROC vs Feature Count — Top Models (Postoperative)",
+  subtitle = "Diamond = recommended k  |  Dotted = 0.65 reference",
+  y_lo = 0.40, y_hi = 0.72,
+  ref_line = 0.65, ref_label = "0.65 reference"
+)
+
+post_fig2 <- make_traintestfig(
+  df_post, SEL6_POST, OPT_K_POST,
+  title    = "Train vs Test AUROC — Selected Models (Postoperative)",
+  subtitle = paste("Solid = Train  |  Dashed = Test  |  Red shading = gap > 0.05",
+                   "|  Blue shading = test exceeds train  |  Diamond = recommended k"),
+  include_blue = TRUE, y_lo = 0.25, y_hi = 0.98
+)
+
+post_fig3 <- make_prauc_fig(
+  df_post, TOP_PR_POST, OPT_K_POST, POST_PREV,
+  title = "Test PRAUC vs Feature Count — Top Models (Postoperative)",
+  dataset_label = "Postoperative"
+)
+
+post_fig4 <- make_allmodels_fig(
+  df_post, ALL_MODELS_ORDER, OPT_K_POST,
+  title        = "All 13 Base Learners: Train vs Test AUROC — Postoperative",
+  include_blue = TRUE
+)
+
+
+# 6. PRE + POST COMBINATION FIGURES
+
+cat("Building Pre+Post combination figures...\n")
+TOP_PP    <- c("glm","avNNet","glmboost","rf","svmLinear","LogitBoost")
+TOP_PR_PP <- c("glm","avNNet","glmboost","rf","svmLinear","LogitBoost")
+SEL6_PP   <- c("glm","avNNet","glmboost","rf","svmLinear","LogitBoost")
+
+prepost_fig1 <- make_topmodels_fig(
+  df_pre_post, TOP_PP, OPT_K_PRE_POST,
+  title    = "Test AUROC vs Feature Count — Top Models (Pre+Post)",
+  subtitle = "Diamond = recommended k",
+  y_lo = 0.45, y_hi = 0.80
+)
+
+prepost_fig2 <- make_traintestfig(
+  df_pre_post, SEL6_PP, OPT_K_PRE_POST,
+  title    = "Train vs Test AUROC — Selected Models (Pre+Post)",
+  subtitle = "Solid = Train  |  Dashed = Test  |  Red shading = gap > 0.05  |  Blue shading = test exceeds train  |  Diamond = recommended k",
+  include_blue = TRUE, y_lo = 0.40, y_hi = 0.98
+)
+
+prepost_fig3 <- make_prauc_fig(
+  df_pre_post, TOP_PR_PP, OPT_K_PRE_POST, PRE_POST_PREV,
+  title = "Test PRAUC vs Feature Count — Top Models (Pre+Post)",
+  dataset_label = "Pre+Post"
+)
+
+prepost_fig4 <- make_allmodels_fig(
+  df_pre_post, ALL_MODELS_ORDER, OPT_K_PRE_POST,
+  title        = "All 13 Base Learners: Train vs Test AUROC — Pre+Post Dataset",
+  include_blue = TRUE
+)
+
+
+# 7. PRE + INTRA COMBINATION FIGURES
+cat("Building Pre+Intra combination figures...\n")
+TOP_PI    <- c("rf","nnet","glmboost","naive_bayes","glm","avNNet")
+TOP_PR_PI <- c("rf","nnet","glmboost","naive_bayes","glm","avNNet")
+SEL6_PI   <- c("rf","nnet","glmboost","naive_bayes","glm","avNNet")
+
+preintra_fig1 <- make_topmodels_fig(
+  df_pre_intra, TOP_PI, OPT_K_PRE_INTRA,
+  title    = "Test AUROC vs Feature Count — Top Models (Pre+Intra)",
+  subtitle = "Diamond = recommended k  |  Dotted = 0.75 reference",
+  y_lo = 0.45, y_hi = 0.82,
+  ref_line = 0.75, ref_label = "0.75 reference"
+)
+
+preintra_fig2 <- make_traintestfig(
+  df_pre_intra, SEL6_PI, OPT_K_PRE_INTRA,
+  title    = "Train vs Test AUROC — Selected Models (Pre+Intra)",
+  subtitle = "Solid = Train  |  Dashed = Test  |  Red shading = gap > 0.05  |  Blue shading = test exceeds train  |  Diamond = recommended k",
+  include_blue = TRUE, y_lo = 0.45, y_hi = 0.98
+)
+
+preintra_fig3 <- make_prauc_fig(
+  df_pre_intra, TOP_PR_PI, OPT_K_PRE_INTRA, PRE_INTRA_PREV,
+  title = "Test PRAUC vs Feature Count — Top Models (Pre+Intra)",
+  dataset_label = "Pre+Intra"
+)
+
+preintra_fig4 <- make_allmodels_fig(
+  df_pre_intra, ALL_MODELS_ORDER, OPT_K_PRE_INTRA,
+  title        = "All 13 Base Learners: Train vs Test AUROC — Pre+Intra Dataset",
+  include_blue = TRUE
+)
+
+
+
+# 8. INTRA + POST COMBINATION FIGURES
+
+
+cat("Building Intra+Post combination figures...\n")
+TOP_IP    <- c("naive_bayes","svmLinear","glmboost","evtree","pam","rf")
+TOP_PR_IP <- c("naive_bayes","svmLinear","glmboost","evtree","pam","rf")
+SEL6_IP   <- c("naive_bayes","svmLinear","glmboost","evtree","pam","rf")
+
+intrapost_fig1 <- make_topmodels_fig(
+  df_intra_post, TOP_IP, OPT_K_INTRA_POST,
+  title    = "Test AUROC vs Feature Count — Top Models (Intra+Post)",
+  subtitle = "Diamond = recommended k",
+  y_lo = 0.45, y_hi = 0.82
+)
+
+intrapost_fig2 <- make_traintestfig(
+  df_intra_post, SEL6_IP, OPT_K_INTRA_POST,
+  title    = "Train vs Test AUROC — Selected Models (Intra+Post)",
+  subtitle = "Solid = Train  |  Dashed = Test  |  Red shading = gap > 0.05  |  Blue shading = test exceeds train  |  Diamond = recommended k",
+  include_blue = TRUE, y_lo = 0.40, y_hi = 0.98
+)
+
+intrapost_fig3 <- make_prauc_fig(
+  df_intra_post, TOP_PR_IP, OPT_K_INTRA_POST, INTRA_POST_PREV,
+  title = "Test PRAUC vs Feature Count — Top Models (Intra+Post)",
+  dataset_label = "Intra+Post"
+)
+
+intrapost_fig4 <- make_allmodels_fig(
+  df_intra_post, ALL_MODELS_ORDER, OPT_K_INTRA_POST,
+  title        = "All 13 Base Learners: Train vs Test AUROC — Intra+Post Dataset",
+  include_blue = TRUE
+)
+# 9. PRE + INTRA + POST COMBINATION FIGURES
+
+cat("Building Pre+Intra+Post combination figures...\n")
+TOP_PIP    <- c("naive_bayes","rf","svmLinear","pam","LogitBoost","avNNet")
+TOP_PR_PIP <- c("naive_bayes","rf","svmLinear","pam","LogitBoost","avNNet")
+SEL6_PIP   <- c("naive_bayes","rf","svmLinear","pam","LogitBoost","avNNet")
+
+full_fig1 <- make_topmodels_fig(
+  df_pre_intra_post, TOP_PIP, OPT_K_PRE_INTRA_POST,
+  title    = "Test AUROC vs Feature Count — Top Models (Pre+Intra+Post)",
+  subtitle = "Diamond = recommended k",
+  y_lo = 0.45, y_hi = 0.82
+)
+
+full_fig2 <- make_traintestfig(
+  df_pre_intra_post, SEL6_PIP, OPT_K_PRE_INTRA_POST,
+  title    = "Train vs Test AUROC — Selected Models (Pre+Intra+Post)",
+  subtitle = "Solid = Train  |  Dashed = Test  |  Red shading = gap > 0.05  |  Blue shading = test exceeds train  |  Diamond = recommended k",
+  include_blue = TRUE, y_lo = 0.45, y_hi = 0.98
+)
+
+full_fig3 <- make_prauc_fig(
+  df_pre_intra_post, TOP_PR_PIP, OPT_K_PRE_INTRA_POST, PRE_INTRA_POST_PREV,
+  title = "Test PRAUC vs Feature Count — Top Models (Pre+Intra+Post)",
+  dataset_label = "Pre+Intra+Post"
+)
+
+full_fig4 <- make_allmodels_fig(
+  df_pre_intra_post, ALL_MODELS_ORDER, OPT_K_PRE_INTRA_POST,
+  title        = "All 13 Base Learners: Train vs Test AUROC — Pre+Intra+Post Dataset",
+  include_blue = TRUE
+)
+# 10. SAVE ALL FIGURES
+cat("Saving figures...\n")
+
+figs <- list(
+  # --- Preoperative (4 figs) ---
+  list(obj = pre_fig1,   file = "PRF_Preop_Fig1_TopModels_TestAUC.png",    w = 9,  h = 5.5),
+  list(obj = pre_fig2,   file = "PRF_Preop_Fig2_TrainTest_Selected.png",   w = 13, h = 8),
+  list(obj = pre_fig3,   file = "PRF_Preop_Fig3_TestPRAUC.png",            w = 9,  h = 5.5),
+  list(obj = pre_fig4,   file = "PRF_Preop_Fig4_AllModels_Grid.png",       w = 18, h = 10),
+  # --- Intraoperative (4 figs) ---
+  list(obj = intra_fig1, file = "PRF_Intra_Fig1_TopModels_TestAUC.png",    w = 9,  h = 5.5),
+  list(obj = intra_fig2, file = "PRF_Intra_Fig2_TrainTest_Selected.png",   w = 13, h = 8),
+  list(obj = intra_fig3, file = "PRF_Intra_Fig3_TestPRAUC.png",            w = 9,  h = 5.5),
+  list(obj = intra_fig4, file = "PRF_Intra_Fig4_AllModels_Grid.png",       w = 18, h = 10),
+  # --- Postoperative (4 figs) ---
+  list(obj = post_fig1,  file = "PRF_Post_Fig1_TopModels_TestAUC.png",     w = 9,  h = 5.5),
+  list(obj = post_fig2,  file = "PRF_Post_Fig2_TrainTest_Selected.png",    w = 13, h = 8),
+  list(obj = post_fig3,  file = "PRF_Post_Fig3_TestPRAUC.png",             w = 9,  h = 5.5),
+  list(obj = post_fig4,  file = "PRF_Post_Fig4_AllModels_Grid.png",        w = 18, h = 10),
+  # --- Pre + Post (4 figs) ---
+  list(obj = prepost_fig1, file = "PRF_PrePost_Fig1_TopModels_TestAUC.png",   w = 9,  h = 5.5),
+  list(obj = prepost_fig2, file = "PRF_PrePost_Fig2_TrainTest_Selected.png",  w = 13, h = 8),
+  list(obj = prepost_fig3, file = "PRF_PrePost_Fig3_TestPRAUC.png",           w = 9,  h = 5.5),
+  list(obj = prepost_fig4, file = "PRF_PrePost_Fig4_AllModels_Grid.png",      w = 18, h = 10),
+  # --- Pre + Intra (4 figs) ---
+  list(obj = preintra_fig1, file = "PRF_PreIntra_Fig1_TopModels_TestAUC.png", w = 9,  h = 5.5),
+  list(obj = preintra_fig2, file = "PRF_PreIntra_Fig2_TrainTest_Selected.png",w = 13, h = 8),
+  list(obj = preintra_fig3, file = "PRF_PreIntra_Fig3_TestPRAUC.png",         w = 9,  h = 5.5),
+  list(obj = preintra_fig4, file = "PRF_PreIntra_Fig4_AllModels_Grid.png",    w = 18, h = 10),
+  # --- Intra + Post (4 figs) ---
+  list(obj = intrapost_fig1, file = "PRF_IntraPost_Fig1_TopModels_TestAUC.png",  w = 9,  h = 5.5),
+  list(obj = intrapost_fig2, file = "PRF_IntraPost_Fig2_TrainTest_Selected.png", w = 13, h = 8),
+  list(obj = intrapost_fig3, file = "PRF_IntraPost_Fig3_TestPRAUC.png",          w = 9,  h = 5.5),
+  list(obj = intrapost_fig4, file = "PRF_IntraPost_Fig4_AllModels_Grid.png",     w = 18, h = 10),
+  # --- Pre + Intra + Post (4 figs) ---
+  list(obj = full_fig1, file = "PRF_Full_Fig1_TopModels_TestAUC.png",         w = 9,  h = 5.5),
+  list(obj = full_fig2, file = "PRF_Full_Fig2_TrainTest_Selected.png",        w = 13, h = 8),
+  list(obj = full_fig3, file = "PRF_Full_Fig3_TestPRAUC.png",                 w = 9,  h = 5.5),
+  list(obj = full_fig4, file = "PRF_Full_Fig4_AllModels_Grid.png",            w = 18, h = 10)
+)
+
+for (fig in figs) {
+  ggsave(fig$file, fig$obj, width = fig$w, height = fig$h, dpi = 300)
+  cat("  Saved:", fig$file, "\n")
+}
+
+cat("\nDone. 28 figures saved to working directory.\n")
+cat("NOTE: Please verify/update the combination-dataset prevalence values:\n")
+cat("  PRE_POST_PREV, PRE_INTRA_PREV, INTRA_POST_PREV, PRE_INTRA_POST_PREV\n")
