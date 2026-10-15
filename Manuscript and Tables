@@ -1,0 +1,898 @@
+
+# PRF MANUSCRIPT TABLES & FIGURES
+required_pkgs <- c("dplyr", "stringr", "gtsummary", "labelled",
+                   "flextable", "officer", "ggplot2", "scales",
+                   "readxl", "fastDummies")
+
+invisible(lapply(required_pkgs, function(p) {
+  if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+  library(p, character.only = TRUE)
+}))
+
+setwd("~/Desktop/Projects/Renal Failure project")
+
+cat("=== PRF Manuscript Tables & Figures ===\n")
+cat("Timestamp:", format(Sys.time()), "\n\n")
+
+
+
+# 1. VERIFY REQUIRED OBJECTS
+CASE_LABELS <- list(
+  preop_only              = "Preoperative",
+  intraop_only             = "Intraoperative",
+  postop_only               = "Postoperative",
+  preop_intraop              = "Preoperative + Intraoperative",
+  preop_postop                 = "Preoperative + Postoperative",
+  intraop_postop                 = "Intraoperative + Postoperative",
+  preop_intraop_postop             = "Preoperative + Intraoperative + Postoperative",
+  preop_intraop_map_only              = "Preoperative + Intraoperative (MAP only)"
+)
+
+if (exists("ALL_CASES")) {
+  cat(sprintf("Found ALL_CASES with %d case(s): %s\n",
+              length(ALL_CASES), paste(names(ALL_CASES), collapse = ", ")))
+  TABLE1_CASES <- ALL_CASES
+} else {
+  required_objects <- c("ds_preop", "ds_intraop", "ds_postop")
+  missing_objects  <- required_objects[!sapply(required_objects, exists)]
+  if (length(missing_objects) > 0)
+    stop(sprintf("Missing: %s\nRun PRF_preprocessing_v4.R or load('prf_workspace.RData')",
+                 paste(missing_objects, collapse = ", ")))
+  cat("ALL_CASES not found -- falling back to legacy 3-case objects (ds_preop/ds_intraop/ds_postop).\n")
+  TABLE1_CASES <- list(preop_only = ds_preop, intraop_only = ds_intraop, postop_only = ds_postop)
+}
+
+cat("Required objects found.\n")
+
+
+
+# SHARED STYLE DEFINITIONS
+# Matches Weaver 2024 / Saif thesis:
+#   - Times New Roman 10pt body, 10pt bold header
+#   - Only horizontal rules (no vertical borders) — journal standard
+#   - Thick top/bottom rules; thin rule below header
+#   - p < 0.05 bolded; p < 0.001 shown as "<0.001"
+
+FONT_NAME  <- "Times New Roman"
+FONT_SIZE  <- 10
+COL_NAVY   <- "#1B3A6B"   # consistent with lab's existing colour scheme
+
+b_thick <- officer::fp_border(color = "black", width = 1.5)
+b_thin  <- officer::fp_border(color = "black", width = 0.75)
+b_none  <- officer::fp_border(width = 0)
+
+style_journal_table <- function(ft) {
+  ft %>%
+    font(fontname = FONT_NAME, part = "all") %>%
+    fontsize(size = FONT_SIZE, part = "all") %>%
+    bold(part = "header") %>%
+    color(color = "black", part = "all") %>%
+    border_remove() %>%
+    hline_top(border = b_thick, part = "header") %>%
+    hline_bottom(border = b_thin,  part = "header") %>%
+    hline_bottom(border = b_thick, part = "body") %>%
+    # Left-align characteristic column; centre all other columns
+    align(j = 1, align = "left",   part = "all") %>%
+    align(j = -1, align = "center", part = "all") %>%
+    padding(padding.top = 2, padding.bottom = 2, part = "all") %>%
+    set_table_properties(layout = "autofit", width = 1)
+}
+
+
+
+# 2. TABLE 1 — PATIENT CHARACTERISTICS BY PRF STATUS
+
+cat("\n--- Building Table 1: Patient Characteristics ---\n")
+
+DROP_COLS <- c("New_MRN", "Surgery_Date", "Surgery_Date_parsed",
+               "OR Entry Date And Time", "OR Exit Date And Time",
+               "flag_missing_bp", "flag_emergent_salvage",
+               "creatinine_baseline", "has_intraop_bp", "has_postop_bp",
+               # Platelet_Count_log is the ML-only, log-transformed feature.
+               # Table 1 is real, un-split, un-oversampled data intended for
+               # the manuscript -- it should report raw Platelet Count
+               # (below, in VAR_LABELS), not the log-transformed version.
+               "Platelet_Count_log")
+
+# Variable labels
+bp_feature_label <- function(colname) {
+  m <- regmatches(colname, regexec("^(Intraop|Postop)_(MAP|SBP)_(.+)$", colname))[[1]]
+  if (length(m) == 0) return(NA_character_)
+  phase  <- if (m[2] == "Intraop") "Intraoperative" else "Postoperative"
+  metric <- m[3]  # "MAP" or "SBP" -- kept as the acronym; caption defines it
+  suffix <- m[4]
+
+  label <- switch(suffix,
+    "Mean"        = sprintf("Average %s %s", phase, metric),
+    "Median"      = sprintf("Median %s %s", phase, metric),
+    "SD"          = sprintf("%s %s Standard Deviation", phase, metric),
+    "Min"         = sprintf("Minimum %s %s", phase, metric),
+    "Max"         = sprintf("Maximum %s %s", phase, metric),
+    "Range"       = sprintf("%s %s Range", phase, metric),
+    "Q1"          = sprintf("%s %s, 25th Percentile", phase, metric),
+    "Q3"          = sprintf("%s %s, 75th Percentile", phase, metric),
+    "IQR"         = sprintf("%s %s Interquartile Range", phase, metric),
+    "ARV"         = sprintf("%s %s Average Real Variability", phase, metric),
+    "Rate_Max"    = sprintf("Maximum Rate of Change in %s %s (per successive reading)", phase, metric),
+    "Rate_Min"    = sprintf("Minimum Rate of Change in %s %s (per successive reading)", phase, metric),
+    "Rate_Median" = sprintf("Median Rate of Change in %s %s (per successive reading)", phase, metric),
+    "Rate_SD"     = sprintf("Standard Deviation of Rate of Change in %s %s (per successive reading)", phase, metric),
+    NA_character_
+  )
+  if (!is.na(label)) return(label)
+
+
+  m2 <- regmatches(suffix, regexec("^Pct_(Below|Above|Drop|Spike)_([0-9]+)$", suffix))[[1]]
+  if (length(m2) == 0) return(NA_character_)
+  direction <- m2[2]; cutoff <- m2[3]
+  switch(direction,
+    "Below" = sprintf("%% of %s %s Readings Below %s mmHg", phase, metric, cutoff),
+    "Above" = sprintf("%% of %s %s Readings Above %s mmHg", phase, metric, cutoff),
+    "Drop"  = sprintf("%% of Successive-Reading Drops in %s %s Exceeding %s mmHg", phase, metric, cutoff),
+    "Spike" = sprintf("%% of Successive-Reading Increases in %s %s Exceeding %s mmHg", phase, metric, cutoff)
+  )
+}
+
+VAR_LABELS <- list(
+  `Patient Age`                                          = "Age, years",
+  Sex                                                    = "Sex",
+  Race                                                   = "Race",
+  `Hispanic or Latino or Spanish Ethnicity`              = "Hispanic/Latino Ethnicity",
+  BMI                                                    = "BMI, kg/m\u00b2",
+  `Last Creatinine Level`                                = "Creatinine, mg/dL",
+  `Total Albumin`                                        = "Albumin, g/dL",
+  `Total Bilirubin`                                      = "Total Bilirubin, mg/dL",
+  `WBC Count`                                            = "WBC Count, cells/\u03bcL",
+  Hemoglobin                                             = "Hemoglobin, g/dL",
+  `Platelet Count`                                       = "Platelet Count, x10\u00b3/\u03bcL",
+  Sodium                                                 = "Sodium, mEq/L",
+  INR                                                    = "INR",
+  `MELD Score`                                           = "MELD Score",
+  `Hemo Data-EF`                                         = "Ejection Fraction, %",
+  `RF-Diabetes`                                          = "Diabetes",
+  `RF-Hypertension`                                      = "Hypertension",
+  `RF- Endocarditis`                                     = "Endocarditis",
+  `RF-Liver Disease`                                     = "Liver Disease",
+  `RF-Liver Cirrhosis`                                   = "Liver Cirrhosis",
+  `Immunocompromised Present`                            = "Immunocompromised",
+  `Mediastinal Radiation`                                = "History of Mediastinal Radiation",
+  `Peripheral Artery Disease`                            = "Peripheral Artery Disease",
+  `Cerebrovascular Disease`                              = "Cerebrovascular Disease",
+  `Cancer Within 5 Years`                                = "Cancer Within 5 Years",
+  `RF-Sleep Apnea`                                       = "Sleep Apnea",
+  `RF-Pneumonia`                                         = "Pneumonia",
+  `RF-Home Oxygen`                                       = "Home Oxygen Use",
+  `RF-Inhaled Medication or Oral Bronchodilator Therapy` = "Inhaled/Oral Bronchodilator",
+  `RF-Alcohol Use`                                       = "Alcohol Use",
+  `Unresponsive State`                                   = "Unresponsive State at Presentation",
+  Syncope                                                = "Syncope",
+  CLD_Combined                                           = "Chronic Lung Disease (Severity, Type)",
+  `RF-Tobacco Use`                                       = "Tobacco Use",
+  `Heart Failure`                                        = "Heart Failure",
+  `Classification-NYHA`                                  = "NYHA Classification",
+  `Cardiogenic Shock`                                    = "Cardiogenic Shock",
+  Resuscitation                                          = "Resuscitation",
+  `Cardiac Arrhythmia`                                   = "Cardiac Arrhythmia",
+  `Prior MI`                                             = "Prior Myocardial Infarction",
+  `Prev Cardiac Interventions`                           = "Prior Cardiac Interventions",
+  Incidence                                              = "Operative Incidence",
+  Status                                                 = "Operative Status",
+  `Meds-ACE Inhibitors or ARB Within 48 Hours`           = "ACE Inhibitor or ARB, 48h",
+  `Meds-Beta Blockers Within 24 Hours`                   = "Beta Blocker, 24h",
+  `Meds-ADP Inhibitors Within Five Days`                 = "ADP Inhibitor, 5 days",
+  `Meds-Aspirin Within Five Days`                        = "Aspirin, 5 days",
+  `Meds-Anticoagulants Within 48 Hours`                  = "Anticoagulant, 48h",
+  `Meds-Inotropes Within 48 Hours`                       = "Inotropes, 48h",
+  `Meds-Steroids Within 24 Hours`                        = "Steroids, 24h",
+  CAB                                                    = "Coronary Artery Bypass",
+  Valve                                                  = "Valve Procedure",
+  `Cardiopulmonary Bypass Time`                          = "Cardiopulmonary Bypass Time, min",
+  `Lowest Intra-op Hemoglobin`                           = "Lowest Intraop Hemoglobin, g/dL",
+  `Highest Intra-op Glucose`                             = "Highest Intraop Glucose, mg/dL"
+)
+
+build_table1 <- function(df, dataset_label, table_number) {
+  cat(sprintf("  Building Table %d: %s\n", table_number, dataset_label))
+
+  relabel_cld <- function(x) {
+    vapply(as.character(x), function(v) {
+      if (is.na(v)) return(NA_character_)
+      if (v == "No") return("No")
+      parts <- strsplit(v, "_")[[1]]
+      if (parts[1] == "Documented" && length(parts) > 1 && parts[2] == "UnknownSeverity") {
+        severity_lab <- "Severity Not Documented"
+        type_raw <- paste(parts[-(1:2)], collapse = "_")
+      } else {
+        severity_lab <- ifelse(parts[1] == "Unknown", "Severity Not Documented", parts[1])
+        type_raw <- paste(parts[-1], collapse = "_")
+      }
+      type_lab <- if (type_raw == "Unknown" || type_raw == "") {
+        "Type Not Documented"
+      } else {
+        paste("Type:", gsub("_", " ", type_raw))
+      }
+      paste0(severity_lab, ", ", type_lab)
+    }, character(1), USE.NAMES = FALSE)
+  }
+
+  df <- df %>%
+    select(-any_of(DROP_COLS)) %>%
+    mutate(
+      PRF = factor(PRF, levels = c(0, 1), labels = c("No PRF", "PRF")),
+      across(where(is.character), as.factor)
+    )
+
+  if ("CLD_Combined" %in% names(df)) {
+    df <- df %>%
+      mutate(CLD_Combined = factor(relabel_cld(CLD_Combined))) %>%
+     
+      mutate(CLD_Combined = forcats::fct_relevel(CLD_Combined, "No"))
+  }
+
+  df <- df %>%
+    mutate(across(
+      where(~is.factor(.) && any(grepl("_", levels(.)))),
+      ~factor(., levels = levels(.), labels = gsub("_", " ", levels(.)))
+    ))
+
+  df <- df %>%
+    mutate(across(
+      where(is.factor) & !any_of("CLD_Combined"),
+      ~ factor(dplyr::na_if(as.character(.), "Unknown"))
+    ))
+
+  existing_labels <- VAR_LABELS[names(VAR_LABELS) %in% names(df)]
+
+  bp_cols <- names(df)[grepl("^(Intraop|Postop)_(MAP|SBP)_", names(df)) &
+                       !names(df) %in% names(existing_labels)]
+  if (length(bp_cols) > 0) {
+    bp_labels <- setNames(lapply(bp_cols, bp_feature_label), bp_cols)
+    bp_labels <- bp_labels[!sapply(bp_labels, is.na)]
+    unresolved <- setdiff(bp_cols, names(bp_labels))
+    if (length(unresolved) > 0)
+      cat(sprintf("  WARNING: could not auto-generate a label for: %s (falling back to raw column name)\n",
+                  paste(unresolved, collapse = ", ")))
+    existing_labels <- c(existing_labels, bp_labels)
+  }
+
+  var_label(df) <- existing_labels
+
+  num_cols <- names(df)[sapply(df, is.numeric) & names(df) != "PRF"]
+  cat_cols  <- names(df)[sapply(df, function(x) is.factor(x)|is.character(x)) &
+                           names(df) != "PRF"]
+
+  tbl <- df %>%
+    tbl_summary(
+      by           = PRF,
+      missing      = "no",
+      type         = list(all_of(num_cols) ~ "continuous",
+                          all_of(cat_cols) ~ "categorical"),
+      statistic    = list(
+        # Matches Weaver format: "Median (IQR)" and "n (%)"
+        all_continuous()  ~ "{median} ({p25}, {p75})",
+        all_categorical() ~ "{n} ({p}%)"
+      ),
+      digits = list(
+        all_continuous()  ~ 2,
+        all_categorical() ~ c(0, 1)
+      )
+    ) %>%
+    add_p(
+      test = list(
+        all_continuous()  ~ "wilcox.test",
+        all_categorical() ~ "chisq.test"
+      ),
+      pvalue_fun = function(x) {
+        ifelse(is.na(x), NA_character_,
+          ifelse(x < 0.001, "<0.001",
+                 sprintf("%.3f", x)))
+      }
+    ) %>%
+    add_overall(last = FALSE) %>%
+    add_n() %>%
+    bold_p(t = 0.05) %>%
+    bold_labels() %>%
+    modify_header(
+      label   ~ "**Characteristic**",
+      stat_0  ~ "**Overall**  \nN = {N}",
+      stat_1  ~ "**No PRF**  \nN = {n}",
+      stat_2  ~ "**PRF**  \nN = {n}",
+      p.value ~ "**p-value**"
+    )
+
+  caption_text <- sprintf(
+    "Patient and clinical characteristics for the %s dataset, by postoperative renal failure (PRF) status.",
+    dataset_label
+  )
+
+  list(tbl = tbl, caption = caption_text)
+}
+
+tbl1_list <- setNames(
+  lapply(seq_along(names(TABLE1_CASES)), function(i) {
+    case_key <- names(TABLE1_CASES)[i]
+    label <- if (case_key %in% names(CASE_LABELS)) CASE_LABELS[[case_key]] else case_key
+    build_table1(TABLE1_CASES[[case_key]], tolower(label), table_number = i)
+  }),
+  names(TABLE1_CASES)
+)
+ft1_list <- setNames(
+  lapply(tbl1_list, function(x) x$tbl %>% as_flex_table() %>% style_journal_table()),
+  names(tbl1_list)
+)
+tbl1_captions <- setNames(
+  lapply(tbl1_list, function(x) x$caption),
+  names(tbl1_list)
+)
+
+cat(sprintf("  Table 1 built for %d case(s).\n", length(ft1_list)))
+
+
+N_TABLE1_VARIANTS <- length(ft1_list)
+TABLE2_NUMBER      <- N_TABLE1_VARIANTS + 1
+
+
+
+# 3. TABLE 2 — MODEL PERFORMANCE METRICS  (LIVE, read from real files)
+cat("\n--- Building Table 2: Model Performance (live from Base Learners files) ---\n")
+
+K_CAP <- 20
+PERF_SOURCE_FILES <- list(
+  Preoperative                     = "Base_Learners_Performance_DF_Preop.xlsx",
+  Intraoperative                   = "Base_Learners_Performance_DF_Intraop.xlsx",
+  Postoperative                    = "Base_Learners_Performance_DF_Postop.xlsx",
+  `Preop + Intraop`                = "Base_Learners_Performance_DF_Preop_Intraop.xlsx",
+  `Preop + Postop`                 = "Base_Learners_Performance_DF_Preop_Postop.xlsx",
+  `Intraop + Postop`               = "Base_Learners_Performance_DF_Intraop_Postop.xlsx",
+  `Preop + Intraop + Postop`       = "Base_Learners_Performance_DF_Preop_Intraop_Postop.xlsx",
+  `Preop + Intraop (MAP only)`     = "Base_Learners_Performance_DF_Preop_Intraop_MAPonly.xlsx"
+)
+
+fmt_metric <- function(x) if (is.null(x) || is.na(x)) "\u2014" else sprintf("%.3f", x)
+fmt_metric_ci <- function(mid, lo, hi) {
+  if (is.null(mid) || is.na(mid)) return("\u2014")
+  if (is.null(lo) || is.na(lo) || is.null(hi) || is.na(hi))
+    return(sprintf("%.2f", mid))
+  sprintf("%.2f (%.2f\u2013%.2f)", mid, lo, hi)
+}
+
+# MANUSCRIPT MODEL SELECTION -- curated by reviewer (DG), NOT automatic.
+# Each case lists a single final model/k pick (Table 3 below shows its
+# feature ranking).
+# k is NOT capped at K_CAP here -- these are hand-picked from the full
+# FeatureNumber range (see e.g. avNNet/MAPonly, whose best Test AUROC is at
+# k=24, outside the old k<=20 cap).
+#
+# All 8 cases are now finalized to a single model/k each; comparisons for
+# Preop+Intraop+Postop (naive_bayes vs rf), Preop+Intraop MAP-only (avNNet
+# vs rf), and Intraop+Postop (naive_bayes vs its nearest competitors) were
+# resolved in favor of the fewer-feature model in every case where the
+# performance uplift from more features was small and/or unstable across k.
+MANUSCRIPT_MODEL_SELECTION <- list(
+  Preoperative                  = list(list(model = "rf",          k = 18)),
+  Intraoperative                 = list(list(model = "glmboost",     k = 6)),
+  Postoperative                   = list(list(model = "rf",          k = 8,
+                                              caveat = "No model for this case reached acceptable Test PRAUC; reported for completeness only.")),
+  `Preop + Intraop`               = list(list(model = "rf",          k = 11)),
+  `Preop + Postop`                 = list(list(model = "glm",        k = 7,
+                                              caveat = "Train-Test gap is a little large but judged manageable).")),
+  `Intraop + Postop`               = list(list(model = "naive_bayes", k = 2,
+                                              caveat = "Best raw Test AUROC of all 13 models")),
+  `Preop + Intraop + Postop`       = list(
+                                        list(model = "naive_bayes", k = 3,
+                                             caveat = "Xompetitive with fewer features than rf.")
+                                      ),
+  `Preop + Intraop (MAP only)`     = list(
+                                        list(model = "rf",          k = 12,
+                                             caveat = "Preferred over avNNet, avNNet's small Test AUROC edge (+0.008) needs 2x the features on a noisy, unstable curve; rf is flat/consistent from k~9 onward.")
+                                      )
+)
+
+get_row_for_model <- function(path, case_label, model, k) {
+  if (!file.exists(path)) {
+    warning(sprintf("Table 2: file not found for '%s' (%s) -- reporting as unavailable.",
+                    case_label, path))
+    return(NULL)
+  }
+  df <- readxl::read_excel(path, sheet = "Base Learners")
+  match_row <- df[df$ModelName == model & df$FeatureNumber == k, ]
+  if (nrow(match_row) == 0) {
+    warning(sprintf("Table 2: no row found for '%s' model='%s' k=%d -- reporting as unavailable.",
+                    case_label, model, k))
+    return(NULL)
+  }
+  match_row[1, ]
+}
+
+perf_rows <- list()
+for (case_label in names(PERF_SOURCE_FILES)) {
+  picks <- MANUSCRIPT_MODEL_SELECTION[[case_label]]
+  for (pick in picks) {
+    row_key <- if (length(picks) > 1) sprintf("%s | %s", case_label, pick$model) else case_label
+    top <- get_row_for_model(PERF_SOURCE_FILES[[case_label]], case_label, pick$model, pick$k)
+    if (is.null(top)) {
+      perf_rows[[row_key]] <- list(
+        Dataset = case_label, Model = sprintf("%s (k=%d, unavailable)", pick$model, pick$k),
+        Caveat = pick$caveat,
+        Train = list(AUROC = NA, AUROC_lo = NA, AUROC_hi = NA,
+                    PRAUC = NA, PRAUC_lo = NA, PRAUC_hi = NA,
+                    F1 = NA, F1_lo = NA, F1_hi = NA),
+        Test  = list(AUROC = NA, PRAUC = NA, F1 = NA)
+      )
+      next
+    }
+    perf_rows[[row_key]] <- list(
+      Dataset = case_label,
+      Model   = sprintf("%s (k=%d)", top$ModelName, top$FeatureNumber),
+      Caveat  = pick$caveat,
+      Train = list(
+        AUROC = top$Train_AUC,
+        AUROC_lo = top$Train_AUC_DeLong_95CI_Lower, AUROC_hi = top$Train_AUC_DeLong_95CI_Upper,
+        PRAUC = top$Train_PRAUC_Boot_Mid,
+        PRAUC_lo = top$Train_PRAUC_95BootCI_Lower, PRAUC_hi = top$Train_PRAUC_95BootCI_Upper,
+        F1    = top$Train_F1_Max_Boot_Mid,
+        F1_lo = top$Train_F1_Max_95BootCI_Lower, F1_hi = top$Train_F1_Max_95BootCI_Upper
+      ),
+      Test  = list(AUROC = top$Test_AUC, PRAUC = top$Test_PRAUC, F1 = top$Test_F1_Max)
+    )
+  }
+}
+
+perf_data <- do.call(rbind, lapply(perf_rows, function(r) {
+  data.frame(
+    Dataset = r$Dataset,
+    Split   = c("Training", "Test"),
+    Model   = r$Model,
+    AUROC   = c(fmt_metric_ci(r$Train$AUROC, r$Train$AUROC_lo, r$Train$AUROC_hi),
+               fmt_metric(r$Test$AUROC)),
+    PRAUC   = c(fmt_metric_ci(r$Train$PRAUC, r$Train$PRAUC_lo, r$Train$PRAUC_hi),
+               fmt_metric(r$Test$PRAUC)),
+    F1      = c(fmt_metric_ci(r$Train$F1, r$Train$F1_lo, r$Train$F1_hi),
+               fmt_metric(r$Test$F1)),
+    stringsAsFactors = FALSE
+  )
+}))
+rownames(perf_data) <- NULL
+
+ft2 <- flextable(perf_data) %>%
+  set_header_labels(
+    Dataset = "Dataset",
+    Split   = "Split",
+    Model   = "Model",
+    AUROC   = "AUROC",
+    PRAUC   = "PRAUC",
+    F1      = "Maximum F1"
+  ) %>%
+  style_journal_table() %>%
+  # Merge Dataset cells that repeat
+  merge_v(j = "Dataset") %>%
+  merge_v(j = "Model") %>%
+  valign(j = "Dataset", valign = "top") %>%
+  valign(j = "Model", valign = "top")
+TABLE2_CAPTION <- "Model performance by case, for the reviewer-selected model and feature count."
+
+cat("  Table 2 built from reviewer-selected models (8 cases; all finalized to a single model/k each).\n")
+
+
+
+# 4b. TABLE 3 -- KEY FEATURES BY MODEL (LIVE)
+cat("\n--- Building Table 3: Key Features by Model ---\n")
+
+TABLE3_NUMBER  <- TABLE2_NUMBER + 1
+FEATURES_SHOWN <- 20
+MASTER_DIRS <- list(
+  Preoperative   = "/Users/mohamedseifeldin/Desktop/Projects/Renal Failure project/Mickey_V6_Cutoff_Results/PRF_Preop/BL_Results_V6_PRF_Preop/PRF",
+  Intraoperative = "/Users/mohamedseifeldin/Desktop/Projects/Renal Failure project/Mickey_V6_Cutoff_Results/PRF_Intraop/BL_Results_V6_PRF_Intraop/PRF",
+  Postoperative  = "/Users/mohamedseifeldin/Desktop/Projects/Renal Failure project/Mickey_V6_Cutoff_Results/PRF_Postop/BL_Results_V6_PRF_Postop/PRF",
+  "Preop + Postop"                 = "/Users/mohamedseifeldin/Desktop/Projects/Renal Failure project/Mickey_V6_Cutoff_Results/PRF_Preop_Postop/BL_Results_V6_PRF_Preop_Postop/PRF",
+  "Preop + Intraop"                = "/Users/mohamedseifeldin/Desktop/Projects/Renal Failure project/Mickey_V6_Cutoff_Results/PRF_Preop_Intraop/BL_Results_V6_PRF_Preop_Intraop/PRF",
+  "Intraop + Postop"               = "/Users/mohamedseifeldin/Desktop/Projects/Renal Failure project/Mickey_V6_Cutoff_Results/PRF_Intraop_Postop/BL_Results_V6_PRF_Intraop_Postop/PRF",
+  "Preop + Intraop + Postop"       = "/Users/mohamedseifeldin/Desktop/Projects/Renal Failure project/Mickey_V6_Cutoff_Results/PRF_Preop_Intraop_Postop/BL_Results_V6_PRF_Preop_Intraop_Postop/PRF",
+  "Preop + Intraop (MAP only)"     = "/Users/mohamedseifeldin/Desktop/Projects/Renal Failure project/Mickey_V6_Cutoff_Results/PRF_Preop_Intraop_MAPonly/BL_Results_V6_PRF_Preop_Intraop_MAPonly/PRF"
+)
+CSV_NAMES <- list(
+  Preoperative                     = "Features_2026-08-29.csv",
+  Intraoperative                   = "Features_2026-08-28.csv",
+  Postoperative                    = "Features_2026-08-29.csv",
+  "Preop + Postop"                 = "Features_2026-08-31.csv",
+  "Preop + Intraop"                = "Features_2026-08-30.csv",
+  "Intraop + Postop"               = "Features_2026-08-29.csv",
+  "Preop + Intraop + Postop"       = "Features_2026-08-30.csv",
+  "Preop + Intraop (MAP only)"     = "Features_2026-08-30.csv"
+)
+RAW_DATA_FILES <- c(
+  Preoperative                     = "preop_only.csv",
+  Intraoperative                   = "intraop_only.csv",
+  Postoperative                    = "postop_only.csv",
+  `Preop + Intraop`                = "preop_intraop.csv",
+  `Preop + Postop`                 = "preop_postop.csv",
+  `Intraop + Postop`               = "intraop_postop.csv",
+  `Preop + Intraop + Postop`       = "preop_intraop_postop.csv",
+  `Preop + Intraop (MAP only)`     = "preop_intraop_map_only.csv"
+)
+
+read_feature_ranking <- function(case, model) {
+  csv_path <- file.path(MASTER_DIRS[[case]], model, CSV_NAMES[[case]])
+  if (!file.exists(csv_path)) {
+    warning(sprintf("Table 3: feature ranking CSV not found for case='%s', model='%s':\n  %s",
+                    case, model, csv_path))
+    return(NULL)
+  }
+  raw <- read.csv(csv_path, row.names = 1, stringsAsFactors = FALSE)
+  raw %>% rename(importance = numeric_val, feature = feature_names) %>% arrange(desc(importance))
+}
+
+encode_raw_data <- function(raw_path) {
+  if (!file.exists(raw_path)) {
+    warning(sprintf("Table 3: raw patient CSV not found: %s", raw_path))
+    return(NULL)
+  }
+  df <- read.csv(raw_path, stringsAsFactors = FALSE, check.names = FALSE)
+  df$PRF_bin <- ifelse(df$PRF == "PRF", 1, 0)
+  if ("Platelet Count" %in% names(df) && !"Platelet_Count_log" %in% names(df))
+    df$Platelet_Count_log <- log(df[["Platelet Count"]])
+  cat_cols <- setdiff(names(df)[sapply(df, is.character)], "PRF")
+  if (length(cat_cols) > 0)
+    df <- dummy_cols(df, select_columns = cat_cols, remove_selected_columns = TRUE, ignore_na = TRUE)
+  df
+}
+
+get_correlations <- function(encoded_df, features) {
+  out <- data.frame(feature = features, corr = NA_real_, pval = NA_real_)
+  missing <- character(0)
+  for (i in seq_along(features)) {
+    f <- features[i]
+    if (f %in% names(encoded_df)) {
+      x <- suppressWarnings(as.numeric(encoded_df[[f]]))
+      test <- tryCatch(
+        cor.test(x, encoded_df$PRF_bin, method = "spearman", exact = FALSE),
+        error = function(e) NULL
+      )
+      if (!is.null(test)) { out$corr[i] <- round(unname(test$estimate), 3); out$pval[i] <- test$p.value }
+    } else {
+      missing <- c(missing, f)
+    }
+  }
+  if (length(missing) > 0)
+    warning(sprintf("Table 3: %d feature(s) had no matching column (left blank): %s",
+                    length(missing), paste(missing, collapse = ", ")))
+  out
+}
+
+fmt_p <- function(p) if (is.na(p)) "\u2014" else if (p < 0.001) "<0.001" else sprintf("%.3f", p)
+
+table3_rows <- list()
+for (case in names(PERF_SOURCE_FILES)) {
+  picks <- MANUSCRIPT_MODEL_SELECTION[[case]]
+  encoded <- encode_raw_data(RAW_DATA_FILES[[case]])
+  for (pick in picks) {
+    ranking <- read_feature_ranking(case, pick$model)
+    if (is.null(ranking) || is.null(encoded)) next
+    top_n <- head(ranking, FEATURES_SHOWN)
+    top_n$Included <- ifelse(seq_len(nrow(top_n)) <= pick$k, "X", "")
+    top_n$PercentRank <- round(top_n$importance / top_n$importance[1] * 100, 1)
+    corrs <- get_correlations(encoded, top_n$feature)
+    section_label <- if (length(picks) > 1)
+      sprintf("%s \u2014 %s (k=%d)", case, pick$model, pick$k)
+    else
+      sprintf("%s (optimum model: %s, k=%d)", case, pick$model, pick$k)
+    table3_rows[[section_label]] <- data.frame(
+      Section     = section_label,
+      Included    = top_n$Included,
+      Feature     = top_n$feature,
+      RankValue   = round(top_n$importance, 2),
+      PercentRank = sprintf("%.1f%%", top_n$PercentRank),
+      CorrValue   = corrs$corr,
+      CorrP       = sapply(corrs$pval, fmt_p),
+      stringsAsFactors = FALSE
+    )
+  }
+}
+
+table3_data <- do.call(rbind, table3_rows)
+rownames(table3_data) <- NULL
+
+ft3 <- table3_data %>%
+  as_grouped_data(groups = "Section") %>%
+  as_flextable() %>%
+  set_header_labels(
+    Included    = "Included in\noptimum model",
+    Feature     = "Feature",
+    RankValue   = "Rank Value",
+    PercentRank = "Percent Rank",
+    CorrValue   = "Correlation\nValue (Spearman)",
+    CorrP       = "Correlation\np-value"
+  ) %>%
+  style_journal_table() %>%
+  bold(j = 1, i = ~ !is.na(Section))
+
+TABLE3_CAPTION <- sprintf(
+  "Key features by model, for each case's reviewer-selected model in Table %d.",
+  TABLE2_NUMBER
+)
+
+cat(sprintf("  Table 3 built for %d model(s) across %d case(s).\n",
+            length(table3_rows), length(PERF_SOURCE_FILES)))
+
+
+
+# 5. FIGURE 1 — PREPROCESSING PIPELINE (ggplot2 flowchart)
+cat("\n--- Building Figure 1: Preprocessing Pipeline ---\n")
+
+n_raw     <- 3692   # STS loaded (log line 5)
+n_preop   <- 2641   # Preoperative dataset finalised (log line 94)
+n_intraop <- 1889   # patients with intraop BP (log line 118)
+n_postop  <- 1977   # patients with postop BP (log line 119)
+excl <- c(
+  "Unknown ethnicity/race"                    = 39 + 249,
+  "Indeterminate PRF outcome"                 = 6,
+  "Preop dialysis"                            = 127,
+  "VAD (admitted or implanted)"               = 0 + 25,
+  "Emergent salvage status"                   = 3,
+  "Non-CABG/Valve procedure"                  = 134,
+  "Baseline creatinine \u22654 mg/dL"          = 5,
+  "Low-missingness row deletion"              = 143,
+  "Unknown home O2/pneumonia/tobacco status"  = 2 + 5 + 68,
+  "Unknown CLD severity/type"                 = 245
+)
+stopifnot(sum(excl) == n_raw - n_preop)  # 1051 -- fails loudly if log numbers ever get out of sync
+case_ns <- c(
+  "Preoperative"                 = 2641,
+  "Intraoperative"               = 1889,
+  "Postoperative"                = 1977,
+  "Preop + Intraop"              = 1889,
+  "Preop + Postop"               = 1977,
+  "Intraop + Postop"             = 1881,
+  "Preop + Intraop + Postop"     = 1881,
+  "Preop + Intraop (MAP only)"   = 1889
+)
+case_prf <- c(7.50, 7.15, 7.13, 7.15, 7.13, 7.07, 7.07, 7.15)  # % PRF, log lines 125-133
+FONT_SCALE <- 1.4
+excl_lines <- sprintf("%s: %d", names(excl), excl)
+excl_pairs <- split(excl_lines, ceiling(seq_along(excl_lines) / 2))
+excl_label <- paste0(
+  sprintf("Exclusions applied (n=%s total, %s\u2192%s)",
+          format(sum(excl), big.mark = ","), format(n_raw, big.mark = ","), format(n_preop, big.mark = ",")),
+  "\n",
+  paste(sapply(excl_pairs, paste, collapse = "  \u00b7  "), collapse = "\n")
+)
+
+boxes <- data.frame(
+  x     = c(0.5, 0.5, 0.5, 0.25, 0.75),
+  label = c(
+    sprintf("STS Database\nN = %s patients", format(n_raw, big.mark = ",")),
+    excl_label,
+    sprintf("Analysis cohort (Preoperative)\nN = %s patients | PRF = %.2f%%",
+            format(n_preop, big.mark = ","), case_prf[1]),
+    sprintf("Intraoperative BP available\nN = %s patients | PRF = %.2f%%",
+            format(n_intraop, big.mark = ","), case_prf[2]),
+    sprintf("Postoperative BP available\nN = %s patients | PRF = %.2f%%",
+            format(n_postop, big.mark = ","), case_prf[3])
+  ),
+  fill  = c("#D6E4F7", "#FDE8EC", "#D6E4F7", "#D0EEEC", "#DAF0E0"),
+  size  = c(3.0, 2.3, 2.8, 2.6, 2.6) * FONT_SCALE,
+  stringsAsFactors = FALSE
+)
+char_w <- 0.0100 * FONT_SCALE
+line_h <- 0.075 * FONT_SCALE
+pad_w  <- 0.04 * FONT_SCALE
+pad_h  <- 0.04 * FONT_SCALE
+boxes$n_lines   <- sapply(strsplit(boxes$label, "\n"), length)
+boxes$max_chars <- sapply(strsplit(boxes$label, "\n"), function(l) max(nchar(l)))
+boxes$width  <- pmin(0.92, pmax(0.30, boxes$max_chars * char_w + pad_w))
+boxes$height <- boxes$n_lines * line_h + pad_h
+GAP <- 0.09 * FONT_SCALE
+y_top <- 1.30
+y_sts   <- y_top - boxes$height[1] / 2
+y_excl  <- y_sts   - boxes$height[1] / 2 - GAP - boxes$height[2] / 2
+y_coh   <- y_excl  - boxes$height[2] / 2 - GAP - boxes$height[3] / 2
+y_split <- y_coh   - boxes$height[3] / 2 - GAP - boxes$height[4] / 2   # Intraop & Postop share this row
+boxes$y <- c(y_sts, y_excl, y_coh, y_split, y_split)
+y_branch_bottom <- y_split - boxes$height[4] / 2
+arrows <- data.frame(
+  x    = c(0.50, 0.50, 0.50, 0.50),
+  xend = c(0.50, 0.50, boxes$x[4], boxes$x[5]),
+  y    = c(boxes$y[1] - boxes$height[1] / 2, boxes$y[2] - boxes$height[2] / 2,
+           boxes$y[3] - boxes$height[3] / 2, boxes$y[3] - boxes$height[3] / 2),
+  yend = c(boxes$y[2] + boxes$height[2] / 2, boxes$y[3] + boxes$height[3] / 2,
+           boxes$y[4] + boxes$height[4] / 2, boxes$y[5] + boxes$height[5] / 2)
+)
+y_legend_header <- y_branch_bottom - (0.10 * FONT_SCALE)
+y_legend_items  <- y_legend_header - (0.06 * FONT_SCALE) - (0.045 * FONT_SCALE) * (seq_along(case_ns) - 1)
+y_bottom  <- min(y_legend_items) - (0.12 * FONT_SCALE)
+
+
+
+fig1 <- ggplot() +
+  geom_tile(data = boxes,
+            aes(x = x, y = y, fill = fill, width = width, height = height),
+            color = "black", linewidth = 0.4) +
+  scale_fill_identity() +
+  geom_text(data = boxes,
+            aes(x = x, y = y, label = label, size = size),
+            family = "serif", lineheight = 1.15) +
+  scale_size_identity() +
+  geom_segment(data = arrows,
+               aes(x = x, xend = xend, y = y, yend = yend),
+               arrow = arrow(length = unit(0.15, "cm"), type = "closed"),
+               linewidth = 0.5, color = "black") +
+  annotate("text", x = 0.5, y = y_legend_header,
+           label = "All 8 modeling cases (feature-set combinations of the cohorts above):",
+           size = 2.7 * FONT_SCALE, family = "serif", fontface = "bold") +
+  annotate("text", x = 0.5, y = y_legend_items,
+           label = sprintf("%s: N = %s (PRF = %.2f%%)", names(case_ns),
+                           format(case_ns, big.mark = ","), case_prf),
+           size = 2.5 * FONT_SCALE, family = "serif", hjust = 0.5) +
+  theme_void() +
+  theme(plot.margin = margin(10, 10, 10, 10)) +
+  coord_cartesian(
+    ylim = c(y_bottom, boxes$y[1] + boxes$height[1] / 2 + 0.05),
+    xlim = c(0.0, 1.0)
+  )
+fig1_height_in <- 10.5 * (boxes$y[1] + boxes$height[1]/2 + 0.05 - y_bottom) / 1.85
+ggsave("PRF_Figure1_Pipeline.png", fig1,
+       width = 6.5, height = max(8, fig1_height_in), dpi = 300, bg = "white")
+cat("  Saved: PRF_Figure1_Pipeline.png\n")
+
+
+
+# 7. ASSEMBLE WORD DOCUMENT
+
+cat("\n--- Assembling Word document ---\n")
+
+doc <- read_docx() %>%
+  # Document settings
+  body_set_default_section(
+    prop_section(
+      page_size      = page_size(width  = 8.5, height = 11, orient = "portrait"),
+      page_margins   = page_mar(top = 1, bottom = 1, left = 1.25, right = 1.25),
+      type           = "continuous"
+    )
+  )
+
+# Title block
+title_par_props <- fp_par(text.align = "center")
+doc <- doc %>%
+  body_add_fpar(
+    fpar(
+      ftext("Postoperative Renal Failure Prediction Following Cardiac Surgery:",
+            fp_text(font.family = FONT_NAME, font.size = 14, bold = TRUE)),
+      fp_p = title_par_props
+    )
+  ) %>%
+  body_add_fpar(
+    fpar(
+      ftext("Manuscript Tables and Figures",
+            fp_text(font.family = FONT_NAME, font.size = 12, bold = TRUE)),
+      fp_p = title_par_props
+    )
+  ) %>%
+  body_add_fpar(
+    fpar(
+      ftext(sprintf("University of Louisville | Renal Failure Project | %s",
+                    format(Sys.Date(), "%B %Y")),
+            fp_text(font.family = FONT_NAME, font.size = 10, italic = TRUE)),
+      fp_p = title_par_props
+    )
+  ) %>%
+  body_add_fpar(
+    fpar(
+      ftext("NOTE: Figure 2 (ROC/PR curves) removed for now, pending export of per-patient predicted probabilities. Tables 1-3 and Figure 1 reflect real data.",
+            fp_text(font.family = FONT_NAME, font.size = 9,
+                    italic = TRUE, color = "#A0364A")),
+      fp_p = fp_par(text.align = "center")
+    )
+  )
+add_tbl_caption <- function(doc, tbl_label, caption_text) {
+  doc %>%
+    body_add_fpar(
+      fpar(
+        ftext(paste0(tbl_label, " \u2013 "),
+              fp_text(font.family = FONT_NAME, font.size = FONT_SIZE, bold = TRUE)),
+        ftext(caption_text,
+              fp_text(font.family = FONT_NAME, font.size = FONT_SIZE)),
+        fp_p = fp_par(text.align = "left")
+      )
+    )
+}
+
+# Table 1: Patient Characteristics
+for (i in seq_along(names(ft1_list))) {
+  case_key <- names(ft1_list)[i]
+  doc <- doc %>%
+    add_tbl_caption(sprintf("Table %d", i), tbl1_captions[[case_key]]) %>%
+    body_add_flextable(ft1_list[[case_key]]) %>%
+    body_add_break()
+}
+
+# ── Table 2: Model Performance─
+doc <- doc %>%
+  add_tbl_caption(sprintf("Table %d", TABLE2_NUMBER), TABLE2_CAPTION) %>%
+  body_add_flextable(ft2) %>%
+  body_add_break()
+
+# ── Table 3: Key Features by Model ─
+doc <- doc %>%
+  add_tbl_caption(sprintf("Table %d", TABLE3_NUMBER), TABLE3_CAPTION) %>%
+  body_add_flextable(ft3) %>%
+  body_add_break()
+add_fig_caption <- function(doc, fig_label, caption_text) {
+  doc %>%
+    body_add_fpar(
+      fpar(
+        ftext(fig_label,
+              fp_text(font.family = FONT_NAME, font.size = FONT_SIZE, bold = TRUE)),
+        ftext(caption_text,
+              fp_text(font.family = FONT_NAME, font.size = FONT_SIZE)),
+        fp_p = fp_par(text.align = "left")
+      )
+    )
+}
+
+FIG1_ACTUAL_W <- 6.5
+FIG1_ACTUAL_H <- max(8, fig1_height_in)
+FIG1_MAX_W <- 6.0
+FIG1_MAX_H <- 9.0
+fig1_scale <- min(FIG1_MAX_W / FIG1_ACTUAL_W, FIG1_MAX_H / FIG1_ACTUAL_H)
+FIG1_EMBED_WIDTH  <- FIG1_ACTUAL_W * fig1_scale
+FIG1_EMBED_HEIGHT <- FIG1_ACTUAL_H * fig1_scale
+
+doc <- doc %>%
+  # ── Figure 1
+  body_add_img("PRF_Figure1_Pipeline.png", width = FIG1_EMBED_WIDTH, height = FIG1_EMBED_HEIGHT) %>%
+  add_fig_caption(
+    "Figure 1",
+    paste0(
+      " \u2013 Data preprocessing pipeline for prediction of postoperative renal",
+      " failure following cardiac surgery. Patient records from the STS registry",
+      " are linked to continuous blood pressure monitoring data and filtered",
+      " through sequential exclusion criteria. Steps 1\u201317 of the preprocessing",
+      " pipeline are applied to produce the preoperative analysis cohort, from",
+      " which the intraoperative- and postoperative-availability subsets and",
+      " their 8 feature-set combinations (Table ", TABLE2_NUMBER, ") are derived.",
+      " The intraoperative and postoperative subsets overlap at N = 1,881",
+      " patients, used by the Intraop+Postop and Preop+Intraop+Postop cases.",
+      " Each case: stratified 70/30 train-test split, random under-sampling",
+      " (RUS), Z-score normalisation, missForest imputation, SMOTE-NC",
+      " (2\u00d7 minority class) oversampling, and k-1 dummy encoding.",
+      " RUS, random under-sampling; SMOTE-NC, Synthetic Minority Oversampling",
+      " Technique \u2014 Nominal Continuous; PRF, postoperative renal failure;",
+      " VAD, ventricular assist device."
+    )
+  )
+
+# Figure 2 (ROC/PR curves) removed for now -- no real per-patient predicted
+# probabilities or threshold-sweep data available to draw real curves from;
+# re-add once that data can be exported from the training pipeline.
+
+# Save document
+print(doc, target = "PRF_Manuscript_Tables.docx")
+cat("  Saved: PRF_Manuscript_Tables.docx\n")
+
+
+
+# 8. FINAL SUMMARY
+
+cat("\n=============================================\n")
+cat("  MANUSCRIPT OUTPUT COMPLETE\n")
+cat("=============================================\n")
+
+files <- c("PRF_Manuscript_Tables.docx",
+           "PRF_Figure1_Pipeline.png")
+
+for (f in files)
+  cat(sprintf("  %-40s  %d KB\n", f, round(file.size(f) / 1024)))
+
+cat("\nContent summary:\n")
+cat(sprintf("  Table 1-%d : Patient characteristics, one table per case (%d cases)\n",
+            N_TABLE1_VARIANTS, N_TABLE1_VARIANTS))
+cat(sprintf("  Table %-2d   : Model Performance (reviewer-selected models; all 8 cases finalized)\n", TABLE2_NUMBER))
+cat(sprintf("  Table %-2d   : Key Features by Model (LIVE -- feature rank + Spearman correlation)\n", TABLE3_NUMBER))
+cat("  Figure 1    : Preprocessing pipeline flowchart (case N's REAL, live; STS raw N and exclusion counts still need PRF_preprocessing_v4.R run against the real data files)\n")
+cat("  Figure 2    : REMOVED for now -- no per-patient predicted probabilities available to draw real curves from.\n")
+cat("\nFormatting:\n")
+cat("  Font        : Times New Roman 10pt (matches Weaver 2024)\n")
+cat("  Table style : Horizontal rules only, no vertical borders (journal standard)\n")
+cat("  p-values    : <0.001 shown as '<0.001'; significant values bolded\n")
+cat("  Figures     : 300 DPI PNG (publication quality)\n")
+cat(sprintf("\nCompleted: %s\n", format(Sys.time())))
