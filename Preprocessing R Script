@@ -1,6 +1,5 @@
 
 # PRF PREPROCESSING PIPELINE
-# University of Louisville  |  Renal Failure Project 2026
 
 # Approved preprocessing steps (Steps 1–17, plus new steps noted above):
 #   1.  Exclude patients on preoperative dialysis
@@ -20,12 +19,15 @@
 #   13. Stratified 70/30 train-test split (createDataPartition) — run per case
 #   14. [Train only] Random Under-Sampling (RUS) — 10:1 neg:pos ratio
 #   15. [Train only] Z-score normalisation (fit on train, applied to test)
+#   15b.Impute remaining missingness with missForest (fit on train via
+#       missForestPredict::missForest, applied to test via missForestPredict)
+#       [CHANGED from median/mode -- see block comment at this step]
 #   16. [Train only] SMOTE-NC (k=5) — double the minority class
 #   17. k-1 dummy encoding of all categorical variables
 
 # 0. SETUP 
 required_pkgs <- c("readxl", "dplyr", "lubridate", "stringr",
-                   "caret", "themis", "fastDummies")
+                   "caret", "themis", "fastDummies", "missForestPredict")
 
 invisible(lapply(required_pkgs, function(p) {
   if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
@@ -35,12 +37,17 @@ invisible(lapply(required_pkgs, function(p) {
 set.seed(2026)
 options(dplyr.summarise.inform = FALSE)
 
-# Set working directory to project folder — all outputs saved here
 setwd("~/Desktop/Projects/Renal Failure project")
 
 # File paths
 STS_PATH <- "sts21_25_deid_V2.xlsx"
 BP_PATH  <- "MEAN_BP_first48h_deid_729.csv"
+
+
+# Date Restrictions
+RESTRICT_TO_2021_2024 <- FALSE
+COHORT_DATE_MIN <- as.Date("2021-01-01")
+COHORT_DATE_MAX <- as.Date("2024-12-31")
 
 # Log helpers
 LOG <- character()
@@ -225,7 +232,7 @@ COLS_TO_KEEP <- c(
   "Highest Intra-op Glucose"
 )
 
-# Silently drop any listed column absent from this extract
+# Drop any listed column absent from this extract
 COLS_TO_KEEP <- COLS_TO_KEEP[COLS_TO_KEEP %in% names(sts_raw)]
 sts <- select(sts_raw, all_of(COLS_TO_KEEP))
 log_msg(sprintf("Retained %d columns from %d total", ncol(sts), ncol(sts_raw)))
@@ -233,7 +240,6 @@ log_msg(sprintf("Retained %d columns from %d total", ncol(sts), ncol(sts_raw)))
 
 
 # 4. OPERATIONAL PREREQUISITES
-#    (date parsing, race construction, flags)
 #    These are data-preparation necessities, not preprocessing tracker steps.
 
 log_msg("\n--- Operational prerequisites ---")
@@ -269,14 +275,20 @@ sts <- sts %>%
       Race == "White"                     ~ "White",
       Race == "Black/African American"    ~ "Black/African American",
       Race == "Asian"                     ~ "Asian",
-      Race == "Am Indian/Alaskan"         ~ "American Indian/Alaskan Native",
-      Race == "Hawaiian/Pacific Islander" ~ "Native Hawaiian/Pacific Islander",
+      # American Indian/Alaskan Native folded into "Other" -- verified only 1
+      # patient in the full raw dataset (n=3,692) matches this level, too
+      # small to report/model as its own category. Same treatment already
+      # applied to Native Hawaiian/Pacific Islander below.
+      Race == "Am Indian/Alaskan"         ~ "Other",
+      # DG comment 41: Native Hawaiian/Pacific Islander is too small a group
+      # (7 patients) to report as its own category -- folded into "Other".
+      Race == "Hawaiian/Pacific Islander" ~ "Other",
       Race == "Other"                     ~ "Other",
       TRUE                                ~ "Unknown/Not Documented"
     )
   ) %>%
   select(-starts_with("Race - Multi-Select-"))
-log_msg("Race variable constructed from Multi-Select columns")
+log_msg("Race variable constructed from Multi-Select columns (Native Hawaiian/Pacific Islander folded into Other per DG comment 41)")
 cat(capture.output(print(table(sts$Race, useNA = "always"))), sep = "\n")
 
 n_before <- nrow(sts)
@@ -289,24 +301,6 @@ n_before <- nrow(sts)
 sts <- filter(sts, is.na(Race) | Race != "Unknown/Not Documented")
 log_step("EXCL-RACE", "Exclude Unknown/Not Documented race", n_before, nrow(sts))
 
-
-# flag_missing_bp: per collaborator, patients with surgery before 2021-07-01
-# had no digitally-captured ANES/OR-monitor BP device readings (bp_id =
-# "ANES_BP"), because that specific capture device/system wasn't in place
-# yet. NOTE: this does NOT mean pre-2021-07-01 patients lack intraoperative
-# BP entirely -- under the current duration-based phase definition (phase is
-# decided by hours_from_start vs. actual surgery duration, regardless of
-# bp_id/device), most of these patients still have SOME BP row -- from a
-# cuff (MAP_BMDI) or arterial line (SBP&DBP_Art) -- falling inside their
-# surgical window, so they aren't automatically excluded from intraop-
-# requiring cases.
-#
-# Left as FALSE/inert below because has_intraop_bp/has_postop_bp already
-# filter on ACTUAL data presence per patient (built from the real BP file
-# rows, using the duration-based phase, not device/anchor type), which
-# handles device availability correctly without needing a separate
-# hardcoded date rule. Kept as a named flag in case a future extract needs
-# an explicit date-based override.
 sts <- sts %>%
   mutate(
     flag_missing_bp = FALSE,
@@ -327,7 +321,6 @@ log_msg(sprintf("flag_emergent_salvage: %d patients (not excluded; analyst decis
 #   (a) within 48h of OR exit
 #   (b) prior to discharge
 # Patients where both are NA and no dialysis recorded -> indeterminate -> excluded.
-# Post-Op-Renal-Dialysis Req: blank in STS = not required (treated as No).
 log_msg("\n--- PRF outcome construction ---")
 
 sts <- sts %>%
@@ -391,13 +384,34 @@ sts <- select(sts,
               -`VAD-Patient Admitted With VAD`,
               -`Ventricular Assist Device Implanted During This Hospitalization`)
 
-# Convert "Unknown" to NA for all binary Yes/No comorbidity columns
+# Convert every non-CLD unknown-coded categorical value to missing before
+# splitting/modeling.  This prevents "Unknown" from becoming a dummy-coded
+# ML feature, including in multi-level fields such as alcohol use and
+# medication fields that also contain "Contraindicated".  The two CLD source
+# fields are intentionally preserved here: Step 7 combines their documented
+# severity/type information into CLD_Combined, which is an established
+# clinical variable rather than a generic unknown category.
+CLD_UNKNOWN_PRESERVE_COLS <- c("RF-Chronic Lung Disease",
+                               "RF-Chronic Lung Disease - Type")
+unknown_recode_cols <- setdiff(
+  names(sts)[vapply(sts, is.character, logical(1))],
+  CLD_UNKNOWN_PRESERVE_COLS
+)
+
+unknown_value_count <- sum(vapply(sts[unknown_recode_cols], function(x) {
+  sum(str_detect(str_to_lower(str_trim(x)), "\\bunknown\\b"), na.rm = TRUE)
+}, numeric(1)))
+
 sts <- sts %>%
   mutate(across(
-    where(~is.character(.) && all(na.omit(.) %in% c("Yes", "No", "Unknown"))),
-    ~na_if(., "Unknown")
+    all_of(unknown_recode_cols),
+    ~if_else(str_detect(str_to_lower(str_trim(.)), "\\bunknown\\b"),
+             NA_character_, .)
   ))
-log_msg(sprintf("Converted 'Unknown' to NA across all binary Yes/No columns"))
+log_msg(sprintf(
+  "Converted %d non-CLD unknown-coded categorical values to NA; established missing-data handling will remove or impute them rather than model them as factor levels.",
+  unknown_value_count
+))
 # Convert NYHA "Not Documented" to NA
 # BUGFIX: the real data contains the value "Not documented" (lowercase "d"),
 # but this used to compare against "Not Documented" (capital "D") via na_if(),
@@ -420,17 +434,6 @@ sts <- filter(sts, !flag_emergent_salvage)
 log_step("EMERGENT", "Exclude Emergent Salvage patients", n_before, nrow(sts))
 
 # CABG/VALVE INCLUSION FILTER  [NEW — previously missing]
-#
-# README (Magenta exclusion notes) / email item #4:
-#   "For all analyses, only CABG and Valve cases should be used in the
-#    analysis. Include iff (column 'CAB' (planned and unplanned)) OR
-#    (column 'Valve' is Yes)."
-#
-# CAB is documented as having planned/unplanned/no-type values rather than a
-# strict Yes/No; the filter below treats anything that isn't an explicit "No"
-# (case-insensitive) as an included CAB case. The unique-value log lines let
-# an analyst confirm the actual coding in this extract before trusting the
-# filter — please check this log output against the real data on first run.
 log_msg("\n--- CABG/Valve surgery type inclusion filter ---")
 log_msg(sprintf("  CAB unique values:   %s",
                 paste(unique(sts$CAB), collapse = " | ")))
@@ -495,6 +498,21 @@ if (length(num_row_delete) > 0)
 if (length(cat_row_delete) > 0)
   sts <- filter(sts, if_all(all_of(cat_row_delete), ~!is.na(.)))
 log_step(4, "Row deletion for low-missingness variables", n_before, nrow(sts))
+
+# STEP 4b — Non-CLD unknown-coded values were converted to NA above and are
+# handled by the established missing-data rules: low-missingness values can
+# trigger row deletion and remaining values are imputed after the train/test
+# split.  No generic unknown category reaches SMOTE-NC or dummy encoding.
+# The separate rare "Current some day smoker" level remains excluded.  The
+# unknown-smoking labels have already been recoded to NA by the global rule.
+log_msg("\n--- Step 4b: Non-CLD unknown categories removed from ML features ---")
+# "Former smoker", and "Never smoker" are retained unchanged.
+n_before <- nrow(sts)
+sts <- filter(sts, is.na(`RF-Tobacco Use`) |
+              `RF-Tobacco Use` != "Current some day smoker")
+log_step("4b-TobaccoUse",
+         "Exclude Current-some-day-smoker; unknown smoking labels recoded to NA",
+         n_before, nrow(sts))
 
 # Report intermediate missingness (>1% numeric, >2% categorical) for analyst review
 mid_miss <- miss_study[
@@ -626,7 +644,7 @@ if ("Last A1C Level" %in% names(sts)) {
 
 
 
-# STEP 9b — Drop MELD Score  [NEW]
+# STEP 9b — Drop MELD Score 
 #
 # README: "MELD score -> DROP". Email item #6: MELD is a score derived from
 # other values already in the dataset (creatinine, bilirubin, INR), so it is
@@ -641,16 +659,6 @@ if ("MELD Score" %in% names(sts)) {
 
 
 # STEP 10 — Log-transform Platelet Count
-
-# Range 15,500–761,000 cells/uL — highly right-skewed.
-# Natural log applied to reduce skew and improve ML model behaviour.
-# CHANGED: both the raw column and the log-transformed column are now kept
-# flowing through (previously the raw column was dropped here). Raw platelet
-# count is more clinically interpretable for descriptive statistics and
-# correlation analysis on the un-split dataset; the log-transformed version
-# remains appropriate for ML model training. The ML-specific pipeline
-# (Steps 14-17, see apply_pipeline_steps_14_to_17) drops the raw column
-# before scaling/SMOTE so model training behavior is unchanged from before.
 if ("Platelet Count" %in% names(sts)) {
   sts <- sts %>%
     mutate(Platelet_Count_log = log(`Platelet Count`))
@@ -686,27 +694,6 @@ bp <- bp %>%
   )
 
 # BP PHASE LABELING  [CORRECTED — bp_id is authoritative]
-#
-# CONFIRMED by collaborator: bp_id has 3 levels, and the mapping to phase is
-# definitive, not inferred:
-#   ANES_BP      -> Intraoperative (OR)
-#   SBP&DBP_Art  -> Postoperative (arterial line)
-#   MAP_BMDI     -> Postoperative (cuff)
-#
-# This supersedes two earlier (wrong) attempts at phase labeling:
-#   1. anchor_src string matching -- anchor_src turned out to just be the
-#      timestamp REFERENCE POINT used to compute hours_from_start, not the
-#      clinical phase, and produced ZERO patient overlap between intraop and
-#      postop (158 postop patients total), which was never plausible.
-#   2. hours_from_start vs. surgery-duration heuristic -- a reasonable proxy
-#      (gave ~2,642 postop / ~2,637 overlap) but still an approximation.
-#
-# bp_id gives a direct, authoritative phase label with no timestamp math
-# needed. Sanity check: median hours_from_start is ~3h for ANES_BP (fits
-# intraop), ~18.5h for SBP&DBP_Art, and ~31h for MAP_BMDI (both fit postop).
-# Under this definition: 2,488 patients have intraop BP, 2,642 have postop
-# BP, and 2,484 have BOTH -- so intraop_postop / preop_intraop_postop are
-# now well-populated cases rather than empty ones.
 
 log_msg("Deriving BP phase directly from bp_id (confirmed authoritative by collaborator)")
 if ("bp_id" %in% names(bp)) {
@@ -900,12 +887,6 @@ log_msg(sprintf("Intraop BP (before excluding first 3 readings/patient): %d read
 log_msg(sprintf("Postop  BP (before excluding first 3 readings/patient): %d readings | %d patients",
                 nrow(bp_post), n_distinct(bp_post$New_MRN)))
 
-# Per Dr. Trivedi: exclude each patient's first 3 BP readings, per phase.
-# The device needs some time to initialize/stabilize, so the earliest
-# readings are somewhat artificial rather than reflecting the patient's
-# true BP. Applied per patient, per phase (intraop and postop handled
-# separately, matching how features are computed for each), ordered by
-# actual measurement time.
 EXCLUDE_FIRST_N_READINGS <- 3
 
 drop_first_n <- function(df, n) {
@@ -958,15 +939,7 @@ log_msg(sprintf("Patients with intraop BP: %d / %d",
 log_msg(sprintf("Patients with postop  BP: %d / %d",
                 sum(sts_full$has_postop_bp),  nrow(sts_full)))
 
-# FEATURE CATEGORIZATION  [FIXED — was the source of the leakage flagged in
-# the meeting]
-#
-# Previously PREOP_FEATS was defined as "everything that is not a BP column",
-# which silently pulled the Blue procedure variables (CAB, Valve,
-# Cardiopulmonary Bypass Time) into the preoperative-only feature set. Those
-# are intraoperative/procedure information (README Blue category) and must
-# only appear in intraoperative or later cases.
-#
+# FEATURE CATEGORIZATION  
 # Categories now used:
 #   BLUE_PROCEDURE_FEATS  - intraoperative procedure info (Blue)
 #   INTRAOP_BP_FEATS       - intraoperative BP features (computed above)
@@ -992,15 +965,6 @@ ID_OUTCOME_COLS <- intersect(
 
 NON_FEATURE_COLS <- c(ID_OUTCOME_COLS, "flag_missing_bp", "flag_emergent_salvage",
                       "has_intraop_bp", "has_postop_bp",
-                      # BUGFIX (per Dr. Trivedi): creatinine_baseline is a literal copy of
-                      # `Last Creatinine Level` created earlier purely to build the PRF
-                      # outcome and apply the baseline-creatinine>=4 exclusion (see lines
-                      # ~354-365, ~469). It was never excluded from the feature set
-                      # afterward, so it and `Last Creatinine Level` ended up as two
-                      # separate, perfectly duplicated columns in every case that includes
-                      # preop features -- most visible in Pre+Intra+Post since that case has
-                      # the most columns. `Last Creatinine Level` remains as the feature;
-                      # creatinine_baseline is now excluded here.
                       "creatinine_baseline")
 
 PREOP_FEATS <- setdiff(
@@ -1090,9 +1054,7 @@ ds_preop_intraop_postop <- make_case(
   require_postop_bp = TRUE,
   name = "preop_intraop_postop")
 
-# NEW per Dr. Trivedi: Preop + Intraop, but restricted to ONLY MAP-derived
-# intraop BP features (no SBP-derived intraop features, no Blue procedure
-# variables like CAB/Valve/CPB time -- just preop + intraop MAP).
+
 INTRAOP_MAP_FEATS <- INTRAOP_BP_FEATS[str_detect(INTRAOP_BP_FEATS, "MAP")]
 log_msg(sprintf("INTRAOP_MAP_FEATS (n=%d): %s",
                 length(INTRAOP_MAP_FEATS), paste(INTRAOP_MAP_FEATS, collapse = ", ")))
@@ -1126,10 +1088,6 @@ make_split <- function(df, name) {
   n_pos   <- sum(df$PRF == 1, na.rm = TRUE)
   n_neg   <- sum(df$PRF == 0, na.rm = TRUE)
 
-  # createDataPartition needs >=2 total rows, and a stratified 70/30 split
-  # needs >=2 patients in EACH class to be meaningful at all. If a case fails
-  # this, it's because its cohort filter (e.g. requiring BOTH intraop AND
-  # postop BP present) leaves too few patients or only one PRF class.
   if (n_total < 2 || n_pos < 2 || n_neg < 2) {
     log_msg(sprintf(
       paste0("  SKIPPING %-20s -- insufficient data for a stratified split ",
@@ -1181,11 +1139,6 @@ if (length(ALL_SPLITS) < length(ALL_CASES)) {
 apply_pipeline_steps_14_to_17 <- function(train_raw, test_raw, dataset_name) {
 
   log_msg(sprintf("\n=== Pipeline Steps 14-17: %s ===", dataset_name))
-
-  # ML training uses the log-transformed Platelet Count only (matches the
-  # originally-approved Step 10 behavior). Raw Platelet Count is kept
-  # upstream for statistics/correlation use but is not an ML feature -- drop
-  # it here if present, so downstream scaling/SMOTE/encoding never sees it.
   if ("Platelet Count" %in% names(train_raw)) {
     train_raw <- select(train_raw, -`Platelet Count`)
     test_raw  <- select(test_raw,  -`Platelet Count`)
@@ -1199,10 +1152,6 @@ apply_pipeline_steps_14_to_17 <- function(train_raw, test_raw, dataset_name) {
   SKIP_COLS <- c(ID_COLS, FLAG_COLS, OUTCOME)
 
   # STEP 14: RUS
-  # Target: 70:30 negative:positive AFTER SMOTE-NC doubles the minority class.
-  # the required neg count before SMOTE-NC is:
-  #   n_neg_target / (2 * n_pos) = 70/30
-  #   n_neg_target = (14/3) * n_pos ≈ 4.67 * n_pos
   
   n_pos        <- sum(train_raw$PRF == 1)
   n_neg        <- sum(train_raw$PRF == 0)
@@ -1233,50 +1182,104 @@ apply_pipeline_steps_14_to_17 <- function(train_raw, test_raw, dataset_name) {
 
   # Pre-SMOTE-NC imputation
   # SMOTE-NC requires complete data. Remaining NAs (intermediate missingness
-  # not handled by Steps 3-4) are imputed here using training set statistics.
-  # Same imputation values are applied to the test set.
-  num_na_cols <- names(train_z)[
-    sapply(train_z, is.numeric) &
-    sapply(train_z, function(x) any(is.na(x))) &
-    !names(train_z) %in% SKIP_COLS
-  ]
-  cat_na_cols <- names(train_z)[
-    (sapply(train_z, is.character) | sapply(train_z, is.logical)) &
-    sapply(train_z, function(x) any(is.na(x))) &
+  # not handled by Steps 3-4) are imputed here.
+  #
+  # CHANGED (was median/mode): switched to missForest imputation.
+  na_cols <- names(train_z)[
+    (sapply(train_z, function(x) any(is.na(x))) |
+     sapply(test_z,  function(x) any(is.na(x)))) &
     !names(train_z) %in% SKIP_COLS
   ]
 
-  impute_medians <- sapply(train_z[num_na_cols], median, na.rm = TRUE)
-  impute_modes   <- sapply(train_z[cat_na_cols], function(x) {
-    tbl <- table(x, useNA = "no")
-    names(tbl)[which.max(tbl)]
-  })
+  if (length(na_cols) > 0) {
+    log_msg(sprintf("  Pre-SMOTE-NC imputation (missForest): %d column(s) have residual missingness: %s",
+                    length(na_cols), paste(na_cols, collapse = ", ")))
 
-  for (col in num_na_cols) {
-    train_z[[col]][is.na(train_z[[col]])] <- impute_medians[[col]]
-    test_z[[col]][is.na(test_z[[col]])]   <- impute_medians[[col]]
-  }
-  for (col in cat_na_cols) {
-    train_z[[col]][is.na(train_z[[col]])] <- impute_modes[[col]]
-    test_z[[col]][is.na(test_z[[col]])]   <- impute_modes[[col]]
+  
+    impute_cols <- setdiff(names(train_z), SKIP_COLS)
+
+    train_for_impute <- train_z[impute_cols]
+    test_for_impute  <- test_z[impute_cols]
+    for (col in impute_cols) {
+      if (is.character(train_for_impute[[col]]) || is.logical(train_for_impute[[col]])) {
+        train_for_impute[[col]] <- as.factor(train_for_impute[[col]])
+        test_for_impute[[col]]  <- factor(test_for_impute[[col]], levels = levels(train_for_impute[[col]]))
+      }
+    }
+
+    mf_fit <- tryCatch({
+      missForest(train_for_impute, save_models = TRUE, verbose = FALSE)
+    }, error = function(e) {
+      log_msg(sprintf("  missForest FAILED on training set (%s) -- falling back to median/mode imputation for this case.",
+                      conditionMessage(e)))
+      NULL
+    })
+
+    if (!is.null(mf_fit)) {
+      train_imputed <- mf_fit$ximp
+      mf_fit$ximp <- NULL  # not needed for predicting test; drop to save memory
+      test_imputed <- tryCatch({
+        missForestPredict(mf_fit, newdata = test_for_impute)
+      }, error = function(e) {
+        log_msg(sprintf("  missForestPredict FAILED on test set (%s) -- falling back to median/mode imputation for this case.",
+                        conditionMessage(e)))
+        NULL
+      })
+
+      if (!is.null(test_imputed)) {
+        train_z[impute_cols] <- train_imputed
+        test_z[impute_cols]  <- test_imputed
+        
+        for (col in impute_cols) {
+          if (is.factor(train_z[[col]])) train_z[[col]] <- as.character(train_z[[col]])
+          if (is.factor(test_z[[col]]))  test_z[[col]]  <- as.character(test_z[[col]])
+        }
+        log_msg("  missForest imputation applied: fit on training set, applied to test set via missForestPredict (no test-set leakage into the imputation model).")
+      } else {
+        mf_fit <- NULL  # trigger fallback below
+      }
+    }
+
+    if (is.null(mf_fit)) {
+    
+      num_na_cols <- names(train_z)[sapply(train_z, is.numeric) & names(train_z) %in% na_cols]
+      cat_na_cols <- names(train_z)[
+        (sapply(train_z, is.character) | sapply(train_z, is.logical)) & names(train_z) %in% na_cols
+      ]
+      if (length(num_na_cols) > 0) {
+        impute_medians <- sapply(train_z[num_na_cols], function(x) {
+          m <- median(x, na.rm = TRUE); if (is.na(m)) 0 else m
+        })
+        for (col in num_na_cols) {
+          train_z[[col]][is.na(train_z[[col]])] <- impute_medians[[col]]
+          test_z[[col]][is.na(test_z[[col]])]   <- impute_medians[[col]]
+        }
+      }
+      if (length(cat_na_cols) > 0) {
+        impute_modes <- sapply(train_z[cat_na_cols], function(x) {
+          tbl <- table(x, useNA = "no")
+          if (length(tbl) == 0) NA_character_ else names(tbl)[which.max(tbl)]
+        })
+        for (col in cat_na_cols) {
+          train_z[[col]][is.na(train_z[[col]])] <- impute_modes[[col]]
+          test_z[[col]][is.na(test_z[[col]])]   <- impute_modes[[col]]
+        }
+      }
+    }
+  } else {
+    log_msg("  Pre-SMOTE-NC imputation: no residual missingness -- nothing to impute.")
   }
 
-  if (length(num_na_cols) + length(cat_na_cols) > 0) {
-    log_msg(sprintf("  Pre-SMOTE-NC imputation: %d numeric (median) + %d categorical (mode)",
-                    length(num_na_cols), length(cat_na_cols)))
-    if (length(num_na_cols) > 0)
-      log_msg(sprintf("    Numeric columns imputed (median): %s",
-                      paste(num_na_cols, collapse = ", ")))
-    if (length(cat_na_cols) > 0)
-      log_msg(sprintf("    Categorical columns imputed (mode): %s",
-                      paste(cat_na_cols, collapse = ", ")))
+ 
+  remaining_na_train <- names(train_z)[sapply(train_z, function(x) any(is.na(x))) & !names(train_z) %in% SKIP_COLS]
+  remaining_na_test  <- names(test_z)[sapply(test_z,  function(x) any(is.na(x))) & !names(test_z)  %in% SKIP_COLS]
+  if (length(remaining_na_train) + length(remaining_na_test) > 0) {
+    log_msg(sprintf(
+      "  WARNING: NAs still present after imputation -- train: %s | test: %s",
+      paste(remaining_na_train, collapse = ", "), paste(remaining_na_test, collapse = ", ")))
   }
 
   # STEP 16: SMOTE-NC — double the minority class
-  # over_ratio = target_minority / majority = (2 * n_pos) / n_neg
-  # This doubles the number of PRF cases (Mickey's approved constraint).
-  # SMOTE-NC handles mixed data: interpolates continuous, copies categorical.
-  # Applied BEFORE dummy encoding so categorical columns are still factors.
   n_pos_rus        <- sum(train_z$PRF == 1)
   n_neg_rus        <- sum(train_z$PRF == 0)
   over_ratio_target <- (2 * n_pos_rus) / n_neg_rus
@@ -1289,10 +1292,6 @@ apply_pipeline_steps_14_to_17 <- function(train_raw, test_raw, dataset_name) {
       !names(train_z) %in% SKIP_COLS
   ]
 
-  # SMOTE-NC needs at least k+1 minority-class rows (it interpolates between
-  # each minority point and its k nearest minority neighbors). Cap k to what's
-  # actually available in this case's training set instead of hardcoding 5,
-  # and skip SMOTE entirely if there isn't even 1 neighbor to interpolate with.
   k_smote <- min(5, n_pos_rus - 1)
 
   if (k_smote < 1) {
@@ -1306,11 +1305,7 @@ apply_pipeline_steps_14_to_17 <- function(train_raw, test_raw, dataset_name) {
       log_msg(sprintf("  NOTE: reducing SMOTE-NC k from 5 to %d (only %d minority rows available)",
                       k_smote, n_pos_rus))
 
-    # Hard safety net: even with k capped to the available minority count,
-    # themis::smotenc() can still throw "Not enough observations of `1`"
-    # (e.g. if a resampled fold or a categorical level leaves too few usable
-    # neighbors internally). Catch it here so one small case can't abort the
-    # whole 3-case pipeline -- fall back to un-oversampled training data.
+    
     train_smoted <- tryCatch({
       train_z %>%
         mutate(across(all_of(cat_cols_for_smote), as.factor),
@@ -1331,7 +1326,6 @@ apply_pipeline_steps_14_to_17 <- function(train_raw, test_raw, dataset_name) {
                        n_pos_rus, sum(train_smoted$PRF)))
 
   # STEP 17: k-1 dummy encoding
-  # Remove SKIP_COLS before encoding; re-attach PRF after.
   skip_train <- SKIP_COLS[SKIP_COLS %in% names(train_smoted)]
   skip_test  <- SKIP_COLS[SKIP_COLS %in% names(test_z)]
 
@@ -1399,17 +1393,9 @@ ALL_PIPELINES <- Map(
   ALL_SPLITS, names(ALL_SPLITS)
 )
 
-# Convenience accessors (train/test data frames per case)
 ALL_TRAIN <- lapply(ALL_PIPELINES, `[[`, "train")
 ALL_TEST  <- lapply(ALL_PIPELINES, `[[`, "test")
 
-# Backward-compatible flat aliases. Downstream scripts (e.g.
-# PRF_statistics_and_export_clean.R) still look for train_preop, test_preop,
-# train_intraop, test_intraop, train_postop, test_postop as standalone
-# objects rather than list elements -- provide them here so those scripts
-# don't need to change. If a case was skipped upstream (insufficient data),
-# its alias is simply not created and the downstream script's own
-# missing-object check will catch it.
 if ("preop_only" %in% names(ALL_TRAIN)) {
   train_preop <- ALL_TRAIN[["preop_only"]]; test_preop <- ALL_TEST[["preop_only"]]
 }
@@ -1452,7 +1438,10 @@ log_msg("Saved: prf_workspace.RData (reload with: load('prf_workspace.RData'))")
 
 
 # FINAL SUMMARY
+
+log_msg("\n=====================================================")
 log_msg("  PREPROCESSING COMPLETE  |  7 cases (3 individual + 4 combinations)")
+log_msg("=====================================================")
 
 for (case_name in names(ALL_PIPELINES)) {
   tr <- ALL_TRAIN[[case_name]]; te <- ALL_TEST[[case_name]]
