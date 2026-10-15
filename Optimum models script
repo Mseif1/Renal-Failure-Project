@@ -1,0 +1,143 @@
+# Extract external test-set ROC and precision-recall (PR) curves for the
+
+source_root <- "/Users/mohamedseifeldin/Desktop/Projects/Renal Failure project/V7_Cutoff_Results"
+output_dir <- "/Users/mohamedseifeldin/Desktop/Projects/PRF_optimum_external_curves"
+
+selected_models <- data.frame(
+  analysis_set = c(
+    "Preoperative",
+    "Intraoperative",
+    "Postoperative",
+    "Preoperative + intraoperative",
+    "Preoperative + postoperative",
+    "Intraoperative + postoperative",
+    "Preoperative + intraoperative + postoperative",
+    "Preoperative + intraoperative (MAP only)"
+  ),
+  case_directory = c(
+    "PRF_Preop",
+    "PRF_Intraop",
+    "PRF_Postop",
+    "PRF_Preop_Intraop",
+    "PRF_Preop_Postop",
+    "PRF_Intraop_Postop",
+    "PRF_Preop_Intraop_Postop",
+    "PRF_Preop_Intraop_MAPonly"
+  ),
+  learner = c(
+    "rf", "rf", NA_character_, "rf",
+    "rf", "avNNet", "rf", NA_character_
+  ),
+  k = c(19L, 13L, NA_integer_, 14L, 18L, 19L, 13L, NA_integer_),
+  stringsAsFactors = FALSE
+)
+
+if (!dir.exists(source_root)) {
+  stop("Source results directory was not found: ", source_root)
+}
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+copy_single_curve <- function(source_directory, output_file, curve_type,
+                              analysis_set, learner, k) {
+  if (!dir.exists(source_directory)) {
+    return(list(status = "missing directory", source = NA_character_))
+  }
+
+  expected_start <- paste0(
+    "EXTERNAL_FEATURE_SUBSET=", k, ".strong_", learner,
+    "_base_learner_model_", curve_type, "_curve_"
+  )
+  candidates <- list.files(source_directory, pattern = "\\.pdf$",
+                           full.names = TRUE, ignore.case = TRUE)
+  matches <- candidates[startsWith(basename(candidates), expected_start)]
+
+  if (length(matches) != 1L) {
+    return(list(
+      status = paste("expected one file; found", length(matches)),
+      source = if (length(matches)) paste(matches, collapse = " | ") else NA_character_
+    ))
+  }
+  if (!file.copy(matches, output_file, overwrite = TRUE)) {
+    return(list(status = "copy failed", source = matches))
+  }
+  list(status = "copied", source = matches)
+}
+
+manifest_rows <- vector("list", nrow(selected_models) * 2L)
+row_index <- 1L
+
+for (i in seq_len(nrow(selected_models))) {
+  item <- selected_models[i, ]
+  if (is.na(item$learner) || is.na(item$k)) {
+    for (curve_type in c("ROC", "PR")) {
+      manifest_rows[[row_index]] <- data.frame(
+        analysis_set = item$analysis_set,
+        case_directory = item$case_directory,
+        learner = NA_character_,
+        feature_subset_k = NA_integer_,
+        curve = curve_type,
+        evaluation_set = "External test",
+        status = "not selected",
+        source_file = NA_character_,
+        extracted_file = NA_character_,
+        stringsAsFactors = FALSE
+      )
+      row_index <- row_index + 1L
+    }
+    next
+  }
+  model_root <- file.path(
+    source_root,
+    item$case_directory,
+    paste0("BL_Results_V7_", item$case_directory),
+    "PRF",
+    item$learner
+  )
+
+  for (curve_type in c("ROC", "PR")) {
+    source_directory <- file.path(model_root, curve_type)
+    safe_case <- gsub("[^A-Za-z0-9]+", "_", item$case_directory)
+    output_file <- file.path(
+      output_dir,
+      paste0(safe_case, "_", item$learner, "_k", item$k,
+             "_external_", curve_type, ".pdf")
+    )
+    result <- copy_single_curve(
+      source_directory, output_file, curve_type,
+      item$analysis_set, item$learner, item$k
+    )
+    manifest_rows[[row_index]] <- data.frame(
+      analysis_set = item$analysis_set,
+      case_directory = item$case_directory,
+      learner = item$learner,
+      feature_subset_k = item$k,
+      curve = curve_type,
+      evaluation_set = "External test",
+      status = result$status,
+      source_file = result$source,
+      extracted_file = if (identical(result$status, "copied")) output_file else NA_character_,
+      stringsAsFactors = FALSE
+    )
+    row_index <- row_index + 1L
+  }
+}
+
+manifest <- do.call(rbind, manifest_rows)
+manifest_file <- file.path(output_dir, "optimum_external_curves_manifest.csv")
+write.csv(manifest, manifest_file, row.names = FALSE)
+
+failed <- !manifest$status %in% c("copied", "not selected")
+if (any(failed)) {
+  warning(
+    sum(failed), " curve(s) were not copied. See the manifest: ", manifest_file,
+    call. = FALSE
+  )
+} else {
+  message(
+    "Extracted ", sum(manifest$status == "copied"),
+    " external test-set curves to: ", output_dir,
+    "; ", sum(manifest$status == "not selected"),
+    " intentionally unselected curve entries were recorded in the manifest."
+  )
+}
+print(manifest[, c("analysis_set", "learner", "feature_subset_k", "curve", "status")])
